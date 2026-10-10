@@ -41,12 +41,13 @@ use super::{
     CasOutcome, CoordinationStore, Entry, Keyspace, Revision, StoreError, WatchEvent, WatchStream,
 };
 use async_nats::jetstream::consumer::{DeliverPolicy, ReplayPolicy, push};
+use async_nats::jetstream::response::Response;
 use async_nats::jetstream::stream::LastRawMessageErrorKind;
 use async_nats::jetstream::{kv, stream};
 use futures_util::StreamExt as _;
 use serde::Deserialize;
 use spate_core::config::redact;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -67,6 +68,9 @@ const MIN_LEASE: Duration = Duration::from_secs(2);
 /// Hard cap on stored values: descriptor + base64 + record envelope must
 /// stay far below NATS's 1 MiB message ceiling.
 const MAX_VALUE_BYTES: i32 = 512 * 1024;
+
+/// Subjects each page of a subject listing repeats from the page before it.
+const SUBJECT_PAGE_OVERLAP: usize = 1024;
 
 /// A secret that never prints: `Debug`/`Display` render `<redacted>`.
 #[derive(Clone, Deserialize)]
@@ -355,6 +359,7 @@ impl NatsConfig {
 
 struct Buckets {
     client: async_nats::Client,
+    jetstream: async_nats::jetstream::Context,
     rejection: Arc<reconnect::Rejection>,
     state: kv::Store,
     lease: kv::Store,
@@ -556,6 +561,7 @@ async fn connect(
     .await?;
     Ok(Buckets {
         client,
+        jetstream,
         rejection,
         state,
         lease,
@@ -692,21 +698,137 @@ fn check_adopted(wanted: &kv::Config, existing: &stream::Config) -> Result<(), S
     Ok(())
 }
 
-/// Whether `key` holds a value, read through the stream leader.
+/// The last message for `key`, value or marker, read through the stream
+/// leader.
 ///
 /// `kv::Store::entry` uses direct get, which any replica may answer, so a
 /// lagging follower can miss a write the leader has acknowledged.
-async fn live_on_leader(bucket: &kv::Store, key: &str) -> Result<bool, StoreError> {
+async fn last_on_leader(
+    bucket: &kv::Store,
+    key: &str,
+) -> Result<Option<async_nats::jetstream::message::StreamMessage>, StoreError> {
     let subject = format!("{}{}", bucket.prefix, key);
     match bucket
         .stream
         .get_last_raw_message_by_subject(&subject)
         .await
     {
-        Ok(message) => Ok(holds_value(&message.headers)),
-        Err(e) if e.kind() == LastRawMessageErrorKind::NoMessageFound => Ok(false),
+        Ok(message) => Ok(Some(message)),
+        Err(e) if e.kind() == LastRawMessageErrorKind::NoMessageFound => Ok(None),
         Err(e) => Err(StoreError::Retryable(format!("read {key}: {e}"))),
     }
+}
+
+/// Whether `key` holds a value, read through the stream leader.
+async fn live_on_leader(bucket: &kv::Store, key: &str) -> Result<bool, StoreError> {
+    Ok(last_on_leader(bucket, key)
+        .await?
+        .is_some_and(|message| holds_value(&message.headers)))
+}
+
+#[derive(serde::Serialize)]
+struct SubjectsRequest<'a> {
+    offset: usize,
+    subjects_filter: &'a str,
+}
+
+#[derive(Deserialize)]
+struct SubjectsPage {
+    state: SubjectsState,
+    cluster: Option<SubjectsCluster>,
+    #[serde(default)]
+    total: usize,
+    #[serde(default)]
+    limit: usize,
+}
+
+#[derive(Deserialize)]
+struct SubjectsState {
+    subjects: Option<BTreeMap<String, u64>>,
+}
+
+#[derive(Deserialize)]
+struct SubjectsCluster {
+    leader: Option<String>,
+}
+
+/// Every subject of `stream` matching `filter` that holds a message, as the
+/// stream leader reports it.
+///
+/// A subject present for the whole call is in the result. Retryable when the
+/// stream has no leader, or when the set shifts between pages by more than
+/// [`SUBJECT_PAGE_OVERLAP`].
+async fn subjects_under(
+    js: &async_nats::jetstream::Context,
+    stream: &str,
+    filter: &str,
+) -> Result<BTreeSet<String>, StoreError> {
+    let what = || format!("subjects under {filter}");
+    let mut subjects = BTreeSet::new();
+    let mut offset = 0;
+    let mut prev_max: Option<String> = None;
+    loop {
+        let reply: Response<SubjectsPage> = js
+            .request(
+                format!("STREAM.INFO.{stream}"),
+                &SubjectsRequest {
+                    offset,
+                    subjects_filter: filter,
+                },
+            )
+            .await
+            .map_err(|e| StoreError::Retryable(format!("{}: {e}", what())))?;
+        let page = match reply {
+            Response::Ok(page) => page,
+            Response::Err { error } => {
+                return Err(StoreError::Retryable(format!("{}: {error}", what())));
+            }
+        };
+        // A group with no leader lets a replica answer from its own state.
+        if page
+            .cluster
+            .and_then(|c| c.leader)
+            .is_none_or(|l| l.is_empty())
+        {
+            return Err(StoreError::Retryable(format!(
+                "{}: the stream has no leader",
+                what()
+            )));
+        }
+        let page_subjects = page.state.subjects.unwrap_or_default();
+        if let Some(prev_max) = &prev_max
+            && !pages_join(prev_max, page_subjects.keys().next().map(String::as_str))
+        {
+            return Err(StoreError::Retryable(format!(
+                "{}: the subject set moved between pages",
+                what()
+            )));
+        }
+        let len = page_subjects.len();
+        prev_max = page_subjects.keys().next_back().cloned();
+        subjects.extend(page_subjects.into_keys());
+        match next_subject_page(offset, len, page.total, page.limit) {
+            Some(next) => offset = next,
+            None => return Ok(subjects),
+        }
+    }
+}
+
+/// The offset of the page after one of `len` subjects at `offset`, or `None`
+/// when that page reached `total`. Consecutive pages share up to
+/// [`SUBJECT_PAGE_OVERLAP`] subjects.
+fn next_subject_page(offset: usize, len: usize, total: usize, limit: usize) -> Option<usize> {
+    if len == 0 || offset + len >= total {
+        return None;
+    }
+    let overlap = SUBJECT_PAGE_OVERLAP.min(limit / 2).min(len / 2);
+    Some(offset + len - overlap)
+}
+
+/// Whether a sorted page whose smallest subject is `first` leaves no gap after
+/// a page whose largest subject was `prev_max`.
+fn pages_join(prev_max: &str, first: Option<&str>) -> bool {
+    first.is_some_and(|first| first <= prev_max)
 }
 
 /// Whether a message with `headers` holds a value. Every marker carries
@@ -720,34 +842,60 @@ fn holds_value(headers: &async_nats::HeaderMap) -> bool {
             .is_none_or(|op| op.as_str() == "PUT")
 }
 
-/// Applies one delivered message for `key` to a listing. A value replaces the
-/// key's entry, so a key delivered twice keeps its later message; a marker
-/// drops the key.
-fn fold_listed(
-    live: &mut BTreeMap<String, Entry>,
-    key: &str,
-    headers: Option<&async_nats::HeaderMap>,
-    value: &[u8],
-    revision: u64,
-) {
-    if headers.is_none_or(holds_value) {
-        live.insert(
-            key.to_string(),
-            Entry {
-                key: key.to_string(),
-                value: value.to_vec(),
-                revision: Revision(revision),
-            },
-        );
-    } else {
-        live.remove(key);
+/// The entries of a listing, folded from delivered messages and leader reads.
+#[derive(Default)]
+struct Listing {
+    live: BTreeMap<String, Entry>,
+}
+
+impl Listing {
+    /// Applies one message for `key`. A value replaces the key's entry, so a
+    /// key delivered twice keeps its later message; a marker drops the key.
+    fn fold(
+        &mut self,
+        key: &str,
+        headers: Option<&async_nats::HeaderMap>,
+        value: &[u8],
+        revision: u64,
+    ) {
+        if headers.is_none_or(holds_value) {
+            self.live.insert(
+                key.to_string(),
+                Entry {
+                    key: key.to_string(),
+                    value: value.to_vec(),
+                    revision: Revision(revision),
+                },
+            );
+        } else {
+            self.live.remove(key);
+        }
+    }
+
+    /// The keys under `key_prefix` among `subjects` of the bucket whose
+    /// subjects start with `bucket_prefix` that hold no value in the listing.
+    fn not_live(
+        &self,
+        subjects: &BTreeSet<String>,
+        bucket_prefix: &str,
+        key_prefix: &str,
+    ) -> Vec<String> {
+        subjects
+            .iter()
+            .filter_map(|subject| subject.strip_prefix(bucket_prefix))
+            .filter(|key| key.starts_with(key_prefix) && !self.live.contains_key(*key))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn into_entries(self) -> Vec<Entry> {
+        self.live.into_values().collect()
     }
 }
 
 /// The next item of a listing or watch snapshot, or Retryable when none
-/// arrives within `bound`. Such a stream ends only on a delivered message
-/// that reports nothing pending, so messages that expire before delivery
-/// leave it waiting forever.
+/// arrives within `bound`. Messages that expire before delivery can leave
+/// such a stream waiting for one that reports nothing pending.
 async fn next_within<S: futures_util::Stream + Unpin>(
     stream: &mut S,
     bound: Duration,
@@ -967,41 +1115,64 @@ impl CoordinationStore for NatsStore {
             })
             .await
             .map_err(|e| StoreError::Retryable(format!("listing {filter}: {e}")))?;
+        let mut listing = Listing::default();
         // An empty filter delivers nothing, so no message reports the end.
-        if consumer.cached_info().num_pending == 0 {
-            return Ok(Vec::new());
-        }
-        let mut messages = consumer
-            .messages()
-            .await
-            .map_err(|e| StoreError::Retryable(format!("listing {filter}: {e}")))?;
-        let stall = self.stall_bound();
-        let mut live = BTreeMap::new();
-        while let Some(message) = next_within(&mut messages, stall, "listing").await? {
-            let message =
-                message.map_err(|e| StoreError::Retryable(format!("listing {filter}: {e}")))?;
-            let info = message
-                .info()
+        if consumer.cached_info().num_pending != 0 {
+            let mut messages = consumer
+                .messages()
+                .await
                 .map_err(|e| StoreError::Retryable(format!("listing {filter}: {e}")))?;
-            let (pending, revision) = (info.pending, info.stream_sequence);
-            if let Some(key) = message.subject.strip_prefix(store.prefix.as_str())
-                && key.starts_with(prefix)
-            {
-                fold_listed(
-                    &mut live,
-                    key,
-                    message.headers.as_ref(),
+            let stall = self.stall_bound();
+            loop {
+                let Some(message) = next_within(&mut messages, stall, "listing").await? else {
+                    return Err(StoreError::Retryable(format!(
+                        "listing {filter} ended early"
+                    )));
+                };
+                let message =
+                    message.map_err(|e| StoreError::Retryable(format!("listing {filter}: {e}")))?;
+                let info = message
+                    .info()
+                    .map_err(|e| StoreError::Retryable(format!("listing {filter}: {e}")))?;
+                let (pending, revision) = (info.pending, info.stream_sequence);
+                if let Some(key) = message.subject.strip_prefix(store.prefix.as_str())
+                    && key.starts_with(prefix)
+                {
+                    listing.fold(key, message.headers.as_ref(), &message.payload, revision);
+                }
+                if pending == 0 {
+                    break;
+                }
+            }
+        }
+        // Pending under-counts while a rewrite replaces a subject's last
+        // message, so the consumer can stop before a live key, and a consumer
+        // on a lagging replica can deliver a marker the leader has replaced.
+        // Every subject under the filter that is not live here is re-read.
+        let subjects = subjects_under(
+            &buckets.jetstream,
+            &store.stream_name,
+            &format!("{}{filter}", store.prefix),
+        )
+        .await?;
+        let mut reads =
+            futures_util::stream::iter(listing.not_live(&subjects, &store.prefix, prefix))
+                .map(|key| async move {
+                    let last = last_on_leader(store, &key).await?;
+                    Ok::<_, StoreError>((key, last))
+                })
+                .buffer_unordered(16);
+        while let Some(read) = reads.next().await {
+            if let (key, Some(message)) = read? {
+                listing.fold(
+                    &key,
+                    Some(&message.headers),
                     &message.payload,
-                    revision,
+                    message.sequence,
                 );
             }
-            if pending == 0 {
-                return Ok(live.into_values().collect());
-            }
         }
-        Err(StoreError::Retryable(format!(
-            "listing {filter} ended early"
-        )))
+        Ok(listing.into_entries())
     }
 }
 
@@ -1033,28 +1204,80 @@ mod tests {
             headers(&[("Nats-Marker-Reason", "Remove")]),
         ];
         for marker in &markers {
-            let mut live = BTreeMap::new();
-            fold_listed(&mut live, "k", None, b"v", 1);
-            fold_listed(&mut live, "k", Some(marker), b"", 2);
-            assert!(live.is_empty(), "{marker:?}");
+            let mut listing = Listing::default();
+            listing.fold("k", None, b"v", 1);
+            listing.fold("k", Some(marker), b"", 2);
+            assert!(listing.into_entries().is_empty(), "{marker:?}");
         }
-        let mut live = BTreeMap::new();
-        fold_listed(&mut live, "k", None, b"old", 1);
-        fold_listed(
-            &mut live,
-            "k",
-            Some(&headers(&[("KV-Operation", "PUT")])),
-            b"new",
-            3,
-        );
+        let mut listing = Listing::default();
+        listing.fold("k", None, b"old", 1);
+        listing.fold("k", Some(&headers(&[("KV-Operation", "PUT")])), b"new", 3);
         assert_eq!(
-            live.into_values().collect::<Vec<_>>(),
+            listing.into_entries(),
             [Entry {
                 key: "k".to_string(),
                 value: b"new".to_vec(),
                 revision: Revision(3),
             }]
         );
+    }
+
+    /// A subject yields a key when it is in the bucket, under the prefix,
+    /// mid-token prefixes included, and holds no value in the listing.
+    #[test]
+    fn keys_not_live_are_under_the_prefix() {
+        let subjects: BTreeSet<String> = [
+            "$KV.b.hb.1",
+            "$KV.b.hb.2",
+            "$KV.b.hbx",
+            "$KV.b.other.1",
+            "$KV.c.hb.3",
+        ]
+        .map(String::from)
+        .into();
+        let mut listing = Listing::default();
+        assert_eq!(
+            listing.not_live(&subjects, "$KV.b.", ""),
+            ["hb.1", "hb.2", "hbx", "other.1"]
+        );
+        listing.fold("hb.1", None, b"v", 1);
+        assert_eq!(listing.not_live(&subjects, "$KV.b.", "hb"), ["hb.2", "hbx"]);
+        assert_eq!(listing.not_live(&subjects, "$KV.b.", "hb."), ["hb.2"]);
+    }
+
+    /// A key whose delivered message is a marker is named for a leader read,
+    /// since a lagging replica can deliver a marker the leader has replaced.
+    #[test]
+    fn a_key_delivered_as_a_marker_is_not_live() {
+        let subjects: BTreeSet<String> = ["$KV.b.hb.1".to_string()].into();
+        let mut listing = Listing::default();
+        listing.fold("hb.1", Some(&headers(&[("KV-Operation", "DEL")])), b"", 1);
+        assert_eq!(listing.not_live(&subjects, "$KV.b.", "hb."), ["hb.1"]);
+    }
+
+    /// Pages after the first start inside the page before them, and a page
+    /// whose first subject sorts past that page's last leaves a gap.
+    #[test]
+    fn subject_pages_overlap_and_join() {
+        assert_eq!(next_subject_page(0, 40_000, 40_000, 100_000), None);
+        assert_eq!(next_subject_page(0, 0, 0, 0), None);
+        assert_eq!(
+            next_subject_page(0, 100_000, 250_000, 100_000),
+            Some(100_000 - SUBJECT_PAGE_OVERLAP)
+        );
+        let second = 100_000 - SUBJECT_PAGE_OVERLAP;
+        assert_eq!(
+            next_subject_page(second, 100_000, 250_000, 100_000),
+            Some(second + 100_000 - SUBJECT_PAGE_OVERLAP)
+        );
+        assert_eq!(
+            next_subject_page(second, 100_000, second + 100_000, 100_000),
+            None
+        );
+        assert!(pages_join("k5", Some("k3")));
+        assert!(pages_join("k5", Some("k5")));
+        assert!(!pages_join("k5", Some("k6")));
+        assert!(!pages_join("k5", None));
     }
 
     /// Both spellings parse from YAML text: the single-key map and the tagged

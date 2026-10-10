@@ -17,13 +17,16 @@ mod scenarios;
 
 use futures_util::StreamExt as _;
 use spate_coordination::store::nats::{NatsConfig, NatsCredentials, NatsStore, Secret};
-use spate_coordination::store::{CasOutcome, CoordinationStore, Keyspace, StoreError, WatchEvent};
+use spate_coordination::store::{
+    CasOutcome, CoordinationStore, Keyspace, Revision, StoreError, WatchEvent,
+};
 use spate_coordination::{
     CoordinationConfig, CoordinationErrorKind, NatsCoordinator, SplitCoordinator, SplitProgress,
     StoreCoordinator,
 };
 use spate_test_support::container_image;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use support::{Held, PhasedPlanner, crash, drive, drive_pair, runtime, split_id};
@@ -418,6 +421,116 @@ fn a_listing_filters_its_consumer_to_the_prefix() {
     });
 }
 
+/// A listing taken while every key under its prefix is CAS-rewritten returns
+/// each key at or above the revision it held when the listing began, under a
+/// dot-terminated and a mid-token prefix. Regression for #985.
+#[test]
+#[ignore = "needs Docker; run explicitly"]
+fn a_listing_under_cas_rewrites_omits_no_live_key() {
+    const LISTINGS: usize = 100;
+    let (_nats, port) = start_nats(None);
+    let rt = runtime();
+    let store =
+        NatsStore::new(nats_config(port, "rewrites"), Duration::from_secs(10)).expect("store");
+    let mut keys: Vec<String> = (0..32).map(|i| format!("hb.{i}")).collect();
+    keys.extend(["hbx".to_string(), "other.1".to_string()]);
+    rt.block_on(async {
+        let mut revisions = Vec::new();
+        for key in &keys {
+            let created = store
+                .create(Keyspace::Ephemeral, key, b"v".to_vec())
+                .await
+                .expect("create")
+                .won()
+                .expect("created");
+            revisions.push(AtomicU64::new(created.0));
+        }
+        let revisions = Arc::new(revisions);
+        let stop = Arc::new(AtomicBool::new(false));
+        let writers: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                let (store, revisions, stop, key) =
+                    (store.clone(), revisions.clone(), stop.clone(), key.clone());
+                tokio::spawn(async move {
+                    let mut revision = Revision(revisions[i].load(Ordering::Acquire));
+                    while !stop.load(Ordering::Acquire) {
+                        match store
+                            .update(Keyspace::Ephemeral, &key, b"v".to_vec(), revision)
+                            .await
+                            .expect("rewrite")
+                        {
+                            CasOutcome::Won(next) => {
+                                revision = next;
+                                revisions[i].store(next.0, Ordering::Release);
+                            }
+                            CasOutcome::Lost => panic!("{key} lost a CAS nobody else writes"),
+                        }
+                    }
+                })
+            })
+            .collect();
+        let snapshot = || -> Vec<u64> {
+            revisions
+                .iter()
+                .map(|r| r.load(Ordering::Acquire))
+                .collect()
+        };
+        let (problems, overlapped) = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut problems = Vec::new();
+            let mut overlapped = 0;
+            for n in 0..LISTINGS {
+                let prefix = if n % 2 == 0 { "hb." } else { "hb" };
+                let floors = snapshot();
+                let listed = store.list(Keyspace::Ephemeral, prefix).await;
+                if floors != snapshot() {
+                    overlapped += 1;
+                }
+                let listed: BTreeMap<String, u64> = match listed {
+                    Ok(listed) => listed.into_iter().map(|e| (e.key, e.revision.0)).collect(),
+                    Err(e) => {
+                        problems.push(format!("listing {n} under {prefix:?} failed: {e}"));
+                        continue;
+                    }
+                };
+                for (key, floor) in keys.iter().zip(floors) {
+                    match (key.starts_with(prefix), listed.get(key)) {
+                        (true, None) => {
+                            problems.push(format!("listing {n} under {prefix:?} omitted {key}"));
+                        }
+                        (true, Some(&revision)) if revision < floor => problems.push(format!(
+                            "listing {n} under {prefix:?} returned {key} at {revision}, \
+                             below {floor}"
+                        )),
+                        (false, Some(_)) => {
+                            problems.push(format!("listing {n} under {prefix:?} returned {key}"));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (problems, overlapped)
+        })
+        .await
+        .expect("the listings hung");
+        stop.store(true, Ordering::Release);
+        for writer in writers {
+            writer.await.expect("writer");
+        }
+        assert!(
+            problems.is_empty(),
+            "{} problems over {LISTINGS} listings, first: {:?}",
+            problems.len(),
+            &problems[..problems.len().min(5)]
+        );
+        assert!(
+            overlapped >= 90,
+            "rewrites overlapped only {overlapped} of {LISTINGS} listings"
+        );
+    });
+}
+
 /// A watch snapshot whose undelivered messages expire ends, with
 /// `SnapshotDone` or as Retryable. Regression for #661.
 #[test]
@@ -760,6 +873,14 @@ authorization { users: [ { user: spate, password: spate } ] }
     }
 }
 
+/// What a [`Proxy`] does to the bytes the server sends.
+#[derive(Clone, Copy)]
+enum Forward {
+    Plain,
+    Throttled(usize),
+    Rewrite(&'static [u8], &'static [u8]),
+}
+
 /// A TCP proxy on `127.0.0.1` that forwards each new connection to the port
 /// `route` last named.
 struct Proxy {
@@ -770,15 +891,22 @@ struct Proxy {
 
 impl Proxy {
     async fn start(target: u16) -> Proxy {
-        Proxy::spawn(target, None).await
+        Proxy::spawn(target, Forward::Plain).await
     }
 
     /// Forwards server-to-client bytes at no more than `bytes_per_sec`.
     async fn throttled(target: u16, bytes_per_sec: usize) -> Proxy {
-        Proxy::spawn(target, Some(bytes_per_sec)).await
+        Proxy::spawn(target, Forward::Throttled(bytes_per_sec)).await
     }
 
-    async fn spawn(target: u16, rate: Option<usize>) -> Proxy {
+    /// Replaces every `from` the server sends with `to`, which must be the
+    /// same length.
+    async fn rewriting(target: u16, from: &'static [u8], to: &'static [u8]) -> Proxy {
+        assert_eq!(from.len(), to.len(), "a rewrite keeps the length");
+        Proxy::spawn(target, Forward::Rewrite(from, to)).await
+    }
+
+    async fn spawn(target: u16, mode: Forward) -> Proxy {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind a local port");
@@ -794,16 +922,24 @@ impl Proxy {
                     else {
                         return;
                     };
-                    match rate {
-                        None => {
+                    match mode {
+                        Forward::Plain => {
                             let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
                         }
-                        Some(rate) => {
+                        Forward::Throttled(rate) => {
                             let (mut client_rx, mut client_tx) = client.split();
                             let (mut server_rx, mut server_tx) = server.split();
                             let _ = tokio::join!(
                                 tokio::io::copy(&mut client_rx, &mut server_tx),
                                 trickle(&mut server_rx, &mut client_tx, rate),
+                            );
+                        }
+                        Forward::Rewrite(from, to) => {
+                            let (mut client_rx, mut client_tx) = client.split();
+                            let (mut server_rx, mut server_tx) = server.split();
+                            let _ = tokio::join!(
+                                tokio::io::copy(&mut client_rx, &mut server_tx),
+                                rewrite(&mut server_rx, &mut client_tx, from, to),
                             );
                         }
                     }
@@ -840,6 +976,43 @@ async fn trickle(
             return Ok(());
         }
         to.write_all(&buf[..n]).await?;
+    }
+}
+
+/// Copies `from` to `to`, replacing every `pattern` with `with`, including one
+/// split across reads.
+async fn rewrite(
+    from: &mut (impl tokio::io::AsyncRead + Unpin),
+    to: &mut (impl tokio::io::AsyncWrite + Unpin),
+    pattern: &[u8],
+    with: &[u8],
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut pending = Vec::new();
+    let mut buf = vec![0; 64 * 1024];
+    loop {
+        let n = from.read(&mut buf).await?;
+        if n == 0 {
+            return to.write_all(&pending).await;
+        }
+        pending.extend_from_slice(&buf[..n]);
+        let mut i = 0;
+        while i + pattern.len() <= pending.len() {
+            if &pending[i..i + pattern.len()] == pattern {
+                pending[i..i + pattern.len()].copy_from_slice(with);
+                i += pattern.len();
+            } else {
+                i += 1;
+            }
+        }
+        // Hold back a tail that could start a match completed by the next read.
+        let keep = (1..pattern.len())
+            .rev()
+            .find(|&k| pending.ends_with(&pattern[..k]))
+            .unwrap_or(0);
+        let cut = pending.len() - keep;
+        to.write_all(&pending[..cut]).await?;
+        pending.drain(..cut);
     }
 }
 
@@ -952,4 +1125,153 @@ fn an_existing_bucket_with_another_replica_count_is_rejected() {
         "{message}"
     );
     assert!(message.contains("configured for 3"), "{message}");
+}
+
+/// A listing whose subject-set reply names no stream leader is Retryable.
+#[test]
+#[ignore = "needs Docker; run explicitly"]
+fn a_listing_whose_subject_reply_names_no_leader_is_retryable() {
+    let (_nats, port) = start_nats(None);
+    let rt = runtime();
+    rt.block_on(async {
+        let proxy = Proxy::rewriting(port, b"\"leader\":\"", b"\"leadex\":\"").await;
+        let store = NatsStore::new(
+            nats_config(proxy.port, "leaderless"),
+            Duration::from_secs(10),
+        )
+        .expect("store");
+        store
+            .create(Keyspace::Ephemeral, "hb.1", b"v".to_vec())
+            .await
+            .expect("create")
+            .won()
+            .expect("created");
+        match store.list(Keyspace::Ephemeral, "hb.").await {
+            Err(StoreError::Retryable(e)) => assert!(e.contains("no leader"), "{e}"),
+            Err(e) => panic!("expected Retryable, got {e:?}"),
+            Ok(listed) => panic!("expected Retryable, got Ok with {} entries", listed.len()),
+        }
+    });
+}
+
+/// A listing whose consumer reports nothing pending at creation, while a key
+/// under its prefix holds a value, returns that key.
+#[test]
+#[ignore = "needs Docker; run explicitly"]
+fn a_listing_whose_consumer_starts_with_nothing_pending_returns_live_keys() {
+    let (_nats, port) = start_nats(None);
+    let rt = runtime();
+    rt.block_on(async {
+        let proxy = Proxy::rewriting(port, b"\"num_pending\":1,", b"\"num_pending\":0,").await;
+        let store = NatsStore::new(nats_config(proxy.port, "unpended"), Duration::from_secs(10))
+            .expect("store");
+        store
+            .create(Keyspace::Ephemeral, "hb.1", b"v".to_vec())
+            .await
+            .expect("create")
+            .won()
+            .expect("created");
+        let listed = store
+            .list(Keyspace::Ephemeral, "hb.")
+            .await
+            .expect("listing");
+        assert_eq!(
+            listed.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+            ["hb.1"]
+        );
+    });
+}
+
+/// A listing whose consumer delivers a marker for a key the leader holds as a
+/// value returns that key.
+#[test]
+#[ignore = "needs Docker; run explicitly"]
+fn a_listing_rereads_a_key_its_consumer_delivered_as_a_marker() {
+    let (_nats, port) = start_nats(None);
+    let rt = runtime();
+    rt.block_on(async {
+        let direct =
+            NatsStore::new(nats_config(port, "marked"), Duration::from_secs(10)).expect("store");
+        direct
+            .create(Keyspace::Ephemeral, "hb.1", b"v".to_vec())
+            .await
+            .expect("create")
+            .won()
+            .expect("created");
+        // Leader reads carry headers base64-encoded, so only the consumer's
+        // delivery is rewritten.
+        let proxy = Proxy::rewriting(
+            port,
+            b"Nats-Expected-Last-Subject-Sequence: 0",
+            b"KV-Operation: DEL\r\nX-Padding-123456: 0",
+        )
+        .await;
+        let store = NatsStore::new(nats_config(proxy.port, "marked"), Duration::from_secs(10))
+            .expect("store");
+        let listed = store
+            .list(Keyspace::Ephemeral, "hb.")
+            .await
+            .expect("listing");
+        assert_eq!(
+            listed.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+            ["hb.1"]
+        );
+    });
+}
+
+/// A listing whose leader read of a deleted key fails is Retryable.
+#[test]
+#[ignore = "needs Docker; run explicitly"]
+fn a_listing_whose_leader_read_fails_is_retryable() {
+    let (_nats, port) = start_nats(None);
+    let rt = runtime();
+    rt.block_on(async {
+        let direct =
+            NatsStore::new(nats_config(port, "unread"), Duration::from_secs(10)).expect("store");
+        let created = direct
+            .create(Keyspace::Ephemeral, "hb.1", b"v".to_vec())
+            .await
+            .expect("create")
+            .won()
+            .expect("created");
+        direct
+            .delete(Keyspace::Ephemeral, "hb.1", Some(created))
+            .await
+            .expect("delete")
+            .won()
+            .expect("deleted");
+        let proxy = Proxy::rewriting(port, b"\"message\":{", b"\"messagX\":{").await;
+        let store = NatsStore::new(nats_config(proxy.port, "unread"), Duration::from_secs(10))
+            .expect("store");
+        match store.list(Keyspace::Ephemeral, "hb.").await {
+            Err(StoreError::Retryable(e)) => assert!(e.contains("read hb.1"), "{e}"),
+            Err(e) => panic!("expected Retryable, got {e:?}"),
+            Ok(listed) => panic!("expected Retryable, got Ok with {} entries", listed.len()),
+        }
+    });
+}
+
+/// A subject-set reply that claims a further page, which does not reach
+/// back into the first, fails the listing as Retryable.
+#[test]
+#[ignore = "needs Docker; run explicitly"]
+fn a_listing_whose_next_subject_page_leaves_a_gap_is_retryable() {
+    let (_nats, port) = start_nats(None);
+    let rt = runtime();
+    rt.block_on(async {
+        let proxy = Proxy::rewriting(port, b"\"total\":1,", b"\"total\":9,").await;
+        let store = NatsStore::new(nats_config(proxy.port, "paged"), Duration::from_secs(10))
+            .expect("store");
+        store
+            .create(Keyspace::Ephemeral, "hb.1", b"v".to_vec())
+            .await
+            .expect("create")
+            .won()
+            .expect("created");
+        match store.list(Keyspace::Ephemeral, "hb.").await {
+            Err(StoreError::Retryable(e)) => assert!(e.contains("moved between pages"), "{e}"),
+            Err(e) => panic!("expected Retryable, got {e:?}"),
+            Ok(listed) => panic!("expected Retryable, got Ok with {} entries", listed.len()),
+        }
+    });
 }
