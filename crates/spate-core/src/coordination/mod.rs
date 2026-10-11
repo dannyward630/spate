@@ -134,8 +134,9 @@ pub struct LeaseEpoch(pub u64);
 ///
 /// The opaque descriptor travels to each worker that gains the split and is
 /// written once at planning. The portable complete stored-value budget is
-/// 384 KiB; under the current encoding, descriptors up to 294,720 raw bytes
-/// reserve padded-base64 expansion and the maximum spec record envelope.
+/// 384 KiB, which every built-in store accepts. Under the current encoding,
+/// descriptors up to 294,720 raw bytes reserve padded-base64 expansion and the
+/// maximum spec record envelope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SplitSpec {
