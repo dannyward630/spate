@@ -39,6 +39,9 @@ pub mod config;
 pub mod coordination;
 pub mod deser;
 pub mod error;
+// Kept out of loom model builds: nothing loom-modelled reads a feed.
+#[cfg(not(loom))]
+pub mod feed;
 pub mod framing;
 pub mod metrics;
 #[cfg(not(loom))]
