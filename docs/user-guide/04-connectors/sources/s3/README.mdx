@@ -442,10 +442,17 @@ lets the rest of the backfill finish first.
 The whole coordinated lifecycle runs against `file://` URLs with no
 infrastructure, which is what the examples this page draws on do: solo,
 and two-instance over a shared in-process store. The Docker-gated suites run
-against a **SeaweedFS** S3 gateway, and, for durable resume and multi-instance
-over the production backend, SeaweedFS plus a
+against a **RustFS** S3 store, and, for durable resume and multi-instance
+over the production backend, RustFS plus a
 [NATS](../../coordination/nats/README.mdx#supported-server-versions) container
 (`cargo test -p spate-s3 -- --ignored --test-threads=1`).
+
+The S3 source ends a listing at the first `ListObjectsV2` page that carries no
+continuation token. The store must return one on every page that has keys after
+it. When a store omits it, a backfill completes without the remaining objects
+and reports no error. SeaweedFS 4.48 omits the token when a page ends on a
+folder marker, a key ending in `/`, and every key after it sits under that
+marker.
 
 ## Metrics
 
