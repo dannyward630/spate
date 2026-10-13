@@ -942,6 +942,179 @@ fn clickhouse_aggregating_mv_example_builds_states() {
     );
 }
 
+/// `clickhouse_load`: a bounded datagen run into a 32-shard Native sink
+/// completes and prints a summary line that echoes its configured `threads`,
+/// `io_threads` and `compression`. A second run, with another thread shape
+/// and codec, writes the same number of rows. The table then holds the rows
+/// and column sums that the same datagen section yields in-process. The two
+/// runs send at least 64 inserts, and none goes through the server's async
+/// buffer.
+///
+/// Equal counts let two builds of the example be compared on the same work.
+/// The seed is fixed, so the line count per order repeats.
+#[test]
+#[ignore = "requires Docker"]
+fn clickhouse_load_completes_and_repeats_its_workload() {
+    let h = Harness::up();
+    // The DDL in the example's module doc.
+    ddl(
+        &h,
+        "CREATE TABLE order_lines (\
+             order_id UInt64, placed_at DateTime64(3), \
+             sku LowCardinality(String), qty UInt32, unit_cents UInt32) \
+         ENGINE = MergeTree ORDER BY (order_id, sku) \
+         SETTINGS non_replicated_deduplication_window = 100",
+    );
+    let config = render_config("clickhouse_load");
+    // The second run fixes the shape the shipped file leaves open, so each
+    // summary field has a configured value to echo.
+    let shaped = config.path.with_file_name("clickhouse_load.shaped.yaml");
+    let rendered = std::fs::read_to_string(&config.path).expect("read rendered config");
+    std::fs::write(
+        &shaped,
+        rendered
+            .replace(
+                "  name: clickhouse-load\n",
+                "  name: clickhouse-load\n  threads: 2\n  io_threads: 3\n",
+            )
+            .replace("compression: lz4", "compression: zstd:3"),
+    )
+    .expect("write shaped config");
+    let env = vec![
+        ("CLICKHOUSE_URL", h.ch_url.clone()),
+        ("CLICKHOUSE_PASSWORD", CH_PASSWORD.to_string()),
+        ("SPATE_LOAD_COUNT", "20000".to_string()),
+    ];
+
+    let mut counts = Vec::new();
+    for (run, path, threads, io_threads, compression) in [
+        (1, &config.path, serde_json::Value::Null, 2, "lz4"),
+        (2, &shaped, serde_json::json!(2), 3, "zstd:3"),
+    ] {
+        if run > 1 {
+            ddl(&h, "TRUNCATE TABLE order_lines");
+        }
+        let log = spawn_as(
+            "clickhouse_load",
+            &format!("clickhouse_load.{run}"),
+            Some(path),
+            &env,
+        )
+        .wait_exit(OUTPUT_DEADLINE);
+        let summary = load_summary(&log);
+        assert_eq!(summary["state"], "completed", "run {run}: {summary}");
+        assert!(summary["wall_ms"].is_u64(), "run {run}: {summary}");
+        assert!(
+            summary["available_parallelism"]
+                .as_u64()
+                .is_some_and(|n| n > 0),
+            "run {run}: {summary}"
+        );
+        assert_eq!(summary["threads"], threads, "run {run}: {summary}");
+        assert_eq!(summary["io_threads"], io_threads, "run {run}: {summary}");
+        assert_eq!(summary["compression"], compression, "run {run}: {summary}");
+        counts.push(h.count("order_lines"));
+    }
+    assert!(counts[0] > 0, "the first run wrote rows: {counts:?}");
+    assert_eq!(
+        counts[0], counts[1],
+        "two runs of the same seed and count wrote the same rows"
+    );
+    let (rows, qty, cents, ids, placed_ms, sku_bytes) = expected_load(20_000);
+    assert_eq!(counts[1], rows, "one row per line of every placed order");
+    assert_eq!(h.scalar("SELECT sum(qty) FROM order_lines"), qty);
+    assert_eq!(h.scalar("SELECT sum(unit_cents) FROM order_lines"), cents);
+    assert_eq!(h.scalar("SELECT sum(order_id) FROM order_lines"), ids);
+    assert_eq!(
+        h.scalar("SELECT toUInt64(sum(toUnixTimestamp64Milli(placed_at))) FROM order_lines"),
+        placed_ms
+    );
+    assert_eq!(
+        h.scalar("SELECT sum(length(sku)) FROM order_lines"),
+        sku_bytes
+    );
+
+    // Every shard sends at least one insert per run, and none goes through
+    // the server's async buffer.
+    ddl(&h, "SYSTEM FLUSH LOGS");
+    let inserts = "FROM system.query_log WHERE type = 'QueryFinish' \
+         AND query_kind = 'Insert' AND has(tables, 'default.order_lines')";
+    let n = h.scalar(&format!("SELECT count() {inserts}"));
+    assert!(n >= 64, "32 shards over two runs: {n} inserts");
+    let n = h.scalar(&format!(
+        "SELECT countIf(ProfileEvents['AsyncInsertQuery'] > 0) {inserts}"
+    ));
+    assert_eq!(n, 0, "async inserts");
+}
+
+/// Rows, then the totals of `qty`, `unit_cents`, `order_id`, `placed_at` in
+/// milliseconds and `sku` length, that the shipped datagen section produces
+/// for `count` events, generated in-process. The event plan does not
+/// depend on the encoding, so the default JSON encoding yields the same
+/// events the example decodes from Avro.
+fn expected_load(count: u64) -> (u64, u64, u64, u64, u64, u64) {
+    use spate::checkpoint::Checkpointer;
+    use spate::source::{PayloadBatch, Source, SourceCtx, SourceEvent, SourceLane};
+    use spate_datagen::{DatagenSource, DatagenSourceConfig, StorefrontEvent};
+    let mut cfg = DatagenSourceConfig::default();
+    cfg.partitions = 32;
+    cfg.seed = 1133;
+    cfg.tick_interval = Duration::ZERO;
+    cfg.count = Some(count);
+    let checkpointer = Checkpointer::new();
+    let mut source = DatagenSource::new(cfg);
+    source
+        .open(SourceCtx::new(checkpointer.handle()))
+        .expect("open datagen");
+    let SourceEvent::LanesAssigned(mut lanes) = source
+        .poll_events(Duration::from_millis(1))
+        .expect("poll datagen")
+    else {
+        panic!("the first poll assigns every lane");
+    };
+    let (mut rows, mut qty, mut cents) = (0, 0, 0);
+    let (mut ids, mut placed_ms, mut sku_bytes) = (0, 0, 0);
+    for lane in &mut lanes {
+        while let Some(mut batch) = lane
+            .poll(4096, Duration::from_millis(1))
+            .expect("poll lane")
+        {
+            while let Some(payload) = batch.next_payload() {
+                if let StorefrontEvent::OrderPlaced(order) =
+                    serde_json::from_slice(payload.bytes).expect("decode event")
+                {
+                    let at = u64::try_from(order.placed_at).expect("after the epoch");
+                    for line in &order.lines {
+                        rows += 1;
+                        qty += u64::from(line.qty);
+                        cents += u64::from(line.unit_cents);
+                        ids += order.order_id;
+                        placed_ms += at;
+                        sku_bytes += u64::try_from(line.sku.len()).expect("fits u64");
+                    }
+                }
+            }
+        }
+    }
+    (rows, qty, cents, ids, placed_ms, sku_bytes)
+}
+
+/// The one JSON line in an example log that carries `wall_ms`. Panics unless
+/// exactly one line does.
+fn load_summary(log: &str) -> serde_json::Value {
+    let summaries: Vec<serde_json::Value> = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|value| value.get("wall_ms").is_some())
+        .collect();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "expected one summary line\n--- log ---\n{log}"
+    );
+    summaries.into_iter().next().expect("one summary")
+}
+
 // ── NATS JetStream ─────────────────────────────────────────────────────────
 
 /// `nats_coordinated_backfill`: a bounded backfill divided over the durable
