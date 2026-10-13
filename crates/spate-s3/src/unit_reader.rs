@@ -21,9 +21,11 @@ use crate::metrics::S3Metrics;
 use crate::split::SplitDescriptor;
 use crate::split_ctx::{LANE_HANDOFF_CHUNKS, PoisonReport, SplitTracker};
 use spate_core::checkpoint::AckIssuer;
-use spate_core::coordination::{ControlWaker, LeaseEpoch, SplitId};
+use spate_core::coordination::{LeaseEpoch, SplitId};
 use spate_core::error::SourceError;
-use spate_core::feed::{Delivery, Feed, FeedError, FeedErrorKind, FeedPark, Receipt, wake_channel};
+use spate_core::feed::{
+    Delivery, Feed, FeedError, FeedErrorKind, FeedPark, FeedWaker, Receipt, wake_channel,
+};
 use spate_core::record::PartitionId;
 use spate_core::source::{DrainBarrier, LaneId, SourceEvent};
 use std::collections::BTreeMap;
@@ -32,8 +34,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// Units held at once: the reader receives only while it holds fewer.
-const UNITS_HELD: usize = 8;
+/// Units held at once: the reader receives only while it holds fewer. The
+/// read parallelism of the measured runs, until #1090's key replaces it.
+const UNITS_HELD: usize = 96;
 
 /// What the reader needs to open a lane, fixed at `open`.
 pub(crate) struct LaneParts {
@@ -69,6 +72,9 @@ struct Held {
 pub(crate) struct UnitReader {
     feed: Arc<dyn Feed>,
     park: FeedPark,
+    /// The waker the feed signals, cloned into every lane so a lane that
+    /// ends or fails ends the park too.
+    waker: FeedWaker,
     parts: LaneParts,
     started: bool,
     /// Sequence number of the next delivery, which names its partition,
@@ -97,11 +103,12 @@ impl std::fmt::Debug for UnitReader {
 impl UnitReader {
     pub(crate) fn new(feed: Arc<dyn Feed>, parts: LaneParts) -> UnitReader {
         let (waker, park) = wake_channel();
-        feed.set_waker(waker);
+        feed.set_waker(waker.clone());
         let (poison_tx, poison_rx) = std::sync::mpsc::channel();
         UnitReader {
             feed,
             park,
+            waker,
             parts,
             started: false,
             next: 0,
@@ -371,10 +378,7 @@ impl UnitReader {
             LeaseEpoch(u64::from(n)),
             Arc::clone(&tracker),
             self.poison_tx.clone(),
-            // The control plane parks on the feed, which this waker cannot
-            // reach, so a lane's end-of-input and poison are noticed when
-            // that park times out.
-            ControlWaker::inert(),
+            self.waker.clone(),
             parts.metrics.clone(),
         );
         self.held.insert(
@@ -446,8 +450,8 @@ mod tests {
     use spate_core::feed::Unit;
     use spate_test::{FeedScript, scripted_feed};
 
-    /// A reader over a scripted feed. The runtime only backs `LaneParts`:
-    /// these tests open no lane and spawn no fetcher.
+    /// A reader over a scripted feed. The runtime is never driven, so a
+    /// fetcher spawned for a lane this reader opens never runs.
     fn reader() -> (UnitReader, FeedScript, tokio::runtime::Runtime) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -536,5 +540,71 @@ mod tests {
 
         reader.settle().unwrap();
         assert_eq!(script.acknowledged(), vec![at_receipt]);
+    }
+
+    /// A unit whose body is a descriptor naming one object, `object-{i}`.
+    fn descriptor_unit(i: usize) -> Unit {
+        let object = crate::split::DescriptorObject {
+            key: format!("object-{i}"),
+            size: 1,
+            etag: None,
+            last_modified_ms: 1,
+        };
+        let body = SplitDescriptor::new(vec![object]).encode().unwrap();
+        Unit::new(format!("unit-{i}"), body)
+    }
+
+    fn lanes_added(event: SourceEvent<S3Lane>) -> Vec<S3Lane> {
+        match event {
+            SourceEvent::LanesAdded(lanes) => lanes,
+            other => panic!("expected LanesAdded, got {other:?}"),
+        }
+    }
+
+    /// Pins the cap on units held: the reader holds at most 96 units,
+    /// leaves the rest queued, and receives only into the room a settled
+    /// unit frees.
+    #[test]
+    fn the_reader_holds_at_most_96_units() {
+        let (mut reader, script, _rt) = reader();
+        let receipts: Vec<Receipt> = (0..98)
+            .map(|i| script.deliver(descriptor_unit(i)))
+            .collect();
+        let first = reader.poll_events(Duration::ZERO).unwrap();
+        assert!(matches!(first, SourceEvent::LanesAssigned(ref l) if l.is_empty()));
+        let lanes = lanes_added(reader.poll_events(Duration::ZERO).unwrap());
+        assert_eq!(lanes.len(), 96, "lanes opened on the first receive");
+        assert_eq!(script.held().len(), 96, "units held");
+
+        script.dead_letter(receipts[0]);
+        let revoked = reader.poll_events(Duration::ZERO).unwrap();
+        assert!(
+            matches!(revoked, SourceEvent::LanesRevoked { ref lanes, .. } if lanes.len() == 1),
+            "expected one lane revoked, got {revoked:?}"
+        );
+        let refill = lanes_added(reader.poll_events(Duration::ZERO).unwrap());
+        assert_eq!(refill.len(), 1, "lanes opened into the freed room");
+        assert_eq!(script.held().len(), 96, "units held after the refill");
+        assert_eq!(script.delivered().len(), 97, "one unit stays queued");
+    }
+
+    /// Pins that a lane the reader opens signals the park the reader waits
+    /// on.
+    #[test]
+    fn every_lane_wakes_the_readers_park() {
+        let (mut reader, script, _rt) = reader();
+        script.deliver(descriptor_unit(0));
+        let first = reader.poll_events(Duration::ZERO).unwrap();
+        assert!(matches!(first, SourceEvent::LanesAssigned(ref l) if l.is_empty()));
+        let mut lanes = lanes_added(reader.poll_events(Duration::ZERO).unwrap());
+        assert_eq!(lanes.len(), 1);
+        // Drain the signal the delivery left in the slot.
+        while reader.park.park(Duration::ZERO) {}
+
+        lanes[0].wake_control();
+        assert!(
+            reader.park.park(Duration::ZERO),
+            "the lane's signal did not reach the reader's park"
+        );
     }
 }
