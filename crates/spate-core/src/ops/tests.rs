@@ -1457,6 +1457,184 @@ fn budget_grows_by_sealed_frame_bytes() {
     assert_eq!(budget.usage(), chunk.frame.len());
 }
 
+/// A terminal stage over `queues` that seals a chunk at `target_bytes`.
+fn order_handoff<R>(
+    queues: ShardQueues,
+    router: R,
+    target_bytes: usize,
+) -> SinkHandoff<Owned<Vec<u8>>, VecEncoder, R>
+where
+    R: RecordRouter<Owned<Vec<u8>>>,
+{
+    use super::chain::{OpMeter, OpMeterSlot};
+    SinkHandoff::new(
+        VecEncoder,
+        router,
+        queues,
+        Arc::new(InflightBudget::new()),
+        ChunkConfig {
+            target_bytes,
+            ..ChunkConfig::default()
+        },
+        OpMeterSlot(OpMeter::new(None)),
+        Arc::from("order"),
+    )
+}
+
+/// A record carrying `payload` and a test acknowledgment.
+fn probe_rec(payload: &[u8]) -> (Record<Vec<u8>>, crossbeam_channel::Receiver<AckMsg>) {
+    let (ack, rx) = AckRef::test_pair();
+    let rec = Record {
+        payload: payload.to_vec(),
+        meta: crate::record::RecordMeta {
+            partition: PartitionId(0),
+            offset: 0,
+            event_time_ms: 0,
+            key_hash: None,
+        },
+        ack,
+    };
+    (rec, rx)
+}
+
+/// Receive every chunk queued for one shard, calling `relieve` after each
+/// so parked chunks follow, and return the rows in arrival order.
+fn drain_relieving<R>(
+    handoff: &mut SinkHandoff<Owned<Vec<u8>>, VecEncoder, R>,
+    rx: &mut tokio::sync::mpsc::Receiver<EncodedChunk>,
+) -> Vec<Vec<u8>> {
+    let mut order = Vec::new();
+    while let Ok(chunk) = rx.try_recv() {
+        order.extend(decode_rows(&chunk.frame));
+        chunk.acks.deliver();
+        let _ = StageLifecycle::relieve(handoff);
+    }
+    order
+}
+
+/// A flush sends a shard's parked chunk before the partial chunk it seals.
+/// Regression for #1138.
+#[test]
+fn a_flush_does_not_send_a_new_chunk_ahead_of_a_parked_one() {
+    let (queues, mut rxs) = shard_queues(1, 1);
+    let mut handoff = order_handoff(queues, ToZero, 8);
+    let mut keep = Vec::new();
+    for p in [&b"AAAA"[..], b"BBBB", b"c"] {
+        let (rec, rx) = probe_rec(p);
+        keep.push(rx);
+        let _ = Collector::push(&mut handoff, rec);
+    }
+    // "AAAA" fills the one-slot queue, "BBBB" parks, "c" is buffered.
+    rxs[0].try_recv().expect("A queued").acks.deliver();
+    let _ = StageLifecycle::flush_terminal(&mut handoff);
+    let order = drain_relieving(&mut handoff, &mut rxs[0]);
+    assert_eq!(order, vec![b"BBBB".to_vec(), b"c".to_vec()]);
+}
+
+/// A chunk sealed by `push` on a shard with a parked chunk goes behind it,
+/// even when the shard's queue has a free slot, and once the parked chunks
+/// drain the shard sends its next chunk directly. Regression for #1138.
+#[test]
+fn a_push_does_not_send_a_new_chunk_ahead_of_a_parked_one() {
+    let (queues, mut rxs) = shard_queues(1, 1);
+    let mut handoff = order_handoff(queues, ToZero, 1);
+    let mut keep = Vec::new();
+    for p in [&b"A"[..], b"B"] {
+        let (rec, rx) = probe_rec(p);
+        keep.push(rx);
+        let _ = Collector::push(&mut handoff, rec);
+    }
+    // "A" fills the one-slot queue and "B" parks. The worker takes "A",
+    // and "C" seals with no `relieve` in between.
+    rxs[0].try_recv().expect("A queued").acks.deliver();
+    let (rec, rx) = probe_rec(b"C");
+    keep.push(rx);
+    let _ = Collector::push(&mut handoff, rec);
+    let _ = StageLifecycle::relieve(&mut handoff);
+    let order = drain_relieving(&mut handoff, &mut rxs[0]);
+    assert_eq!(order, vec![b"B".to_vec(), b"C".to_vec()]);
+    // With nothing left parked, the next seal goes straight to the queue.
+    let (rec, rx) = probe_rec(b"D");
+    keep.push(rx);
+    let _ = Collector::push(&mut handoff, rec);
+    let chunk = rxs[0].try_recv().expect("D queued without a relieve");
+    assert_eq!(decode_rows(&chunk.frame), vec![b"D".to_vec()]);
+    chunk.acks.deliver();
+}
+
+/// A shard with nothing parked sends a sealed chunk straight to its queue
+/// while another shard holds a parked chunk.
+#[test]
+fn a_parked_chunk_does_not_hold_back_another_shard() {
+    let (queues, mut rxs) = shard_queues(2, 1);
+    let mut handoff = order_handoff(queues, ByPrefix, 1);
+    let mut keep = Vec::new();
+    // "a" fills shard 0's one-slot queue and "b" parks behind it.
+    for p in [&b"a"[..], b"b", b"s1:z"] {
+        let (rec, rx) = probe_rec(p);
+        keep.push(rx);
+        let _ = Collector::push(&mut handoff, rec);
+    }
+    let chunk = rxs[1]
+        .try_recv()
+        .expect("shard 1 queued its chunk while shard 0 had one parked");
+    assert_eq!(decode_rows(&chunk.frame), vec![b"s1:z".to_vec()]);
+    chunk.acks.deliver();
+    let order = drain_relieving(&mut handoff, &mut rxs[0]);
+    assert_eq!(order, vec![b"a".to_vec(), b"b".to_vec()]);
+}
+
+/// A shard other than the first counts its parked chunks down as they
+/// drain, so its next seal goes straight to its queue.
+#[test]
+fn a_second_shard_sends_directly_once_its_parked_chunks_drain() {
+    let (queues, mut rxs) = shard_queues(2, 1);
+    let mut handoff = order_handoff(queues, ByPrefix, 1);
+    let mut keep = Vec::new();
+    // "s1:a" fills shard 1's one-slot queue and "s1:b" parks behind it.
+    for p in [&b"s1:a"[..], b"s1:b"] {
+        let (rec, rx) = probe_rec(p);
+        keep.push(rx);
+        let _ = Collector::push(&mut handoff, rec);
+    }
+    let order = drain_relieving(&mut handoff, &mut rxs[1]);
+    assert_eq!(order, vec![b"s1:a".to_vec(), b"s1:b".to_vec()]);
+    let (rec, rx) = probe_rec(b"s1:c");
+    keep.push(rx);
+    let _ = Collector::push(&mut handoff, rec);
+    let chunk = rxs[1].try_recv().expect("s1:c queued without a relieve");
+    assert_eq!(decode_rows(&chunk.frame), vec![b"s1:c".to_vec()]);
+    chunk.acks.deliver();
+}
+
+/// A chunk sealed while a shard still has one chunk parked after a
+/// partial drain goes behind it, on a shard other than the first.
+#[test]
+fn a_seal_waits_behind_a_chunk_still_parked_after_a_partial_drain() {
+    let (queues, mut rxs) = shard_queues(2, 1);
+    let mut handoff = order_handoff(queues, ByPrefix, 1);
+    let mut keep = Vec::new();
+    // "s1:a" fills shard 1's one-slot queue; "s1:b" and "s1:c" park behind it.
+    for p in [&b"s1:a"[..], b"s1:b", b"s1:c"] {
+        let (rec, rx) = probe_rec(p);
+        keep.push(rx);
+        let _ = Collector::push(&mut handoff, rec);
+    }
+    rxs[1].try_recv().expect("s1:a queued").acks.deliver();
+    // "s1:b" takes the freed slot and "s1:c" stays parked.
+    let _ = StageLifecycle::relieve(&mut handoff);
+    let b = rxs[1].try_recv().expect("s1:b queued");
+    assert_eq!(decode_rows(&b.frame), vec![b"s1:b".to_vec()]);
+    b.acks.deliver();
+    // The queue has a free slot when "s1:d" seals.
+    let (rec, rx) = probe_rec(b"s1:d");
+    keep.push(rx);
+    let _ = Collector::push(&mut handoff, rec);
+    let _ = StageLifecycle::relieve(&mut handoff);
+    let order = drain_relieving(&mut handoff, &mut rxs[1]);
+    assert_eq!(order, vec![b"s1:c".to_vec(), b"s1:d".to_vec()]);
+}
+
 #[test]
 fn multi_shard_routing_by_key_hash() {
     #[derive(Clone, Copy)]
