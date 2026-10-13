@@ -7,7 +7,8 @@ use crate::deser::{BytesPassthrough, Deserializer, EmitRecord, Owned, RecFamily}
 use crate::error::{DeserError, ErrorPolicy, SinkError};
 use crate::record::{PartitionId, RawPayload, Record};
 use crate::sink::{
-    EncodedChunk, KeyHashRouter, RecordRouter, RowEncoder, ShardQueues, ShardRouter, shard_queues,
+    EncodedChunk, FrameCodec, FrameCodecFactory, KeyHashRouter, RecordRouter, RowEncoder,
+    ShardQueues, ShardRouter, shard_queues,
 };
 use crate::source::PayloadBatch;
 use bytes::BytesMut;
@@ -2654,4 +2655,506 @@ fn a_fatal_on_replay_fails_the_batch_and_clears_the_stash() {
     assert_eq!(statuses[0], AckStatus::Failed);
     let name = crate::metrics::names::DESER_NOT_READY_TOTAL;
     assert_eq!(series_value(&rendered, name, "fataltest"), 1, "{rendered}");
+}
+
+// ---- frame codec -------------------------------------------------------------
+
+/// Where each [`PrefixCodec`] call ran, in call order.
+type CodecCalls = Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>;
+
+/// A [`FrameCodec`] that writes `prefix` followed by the chunk, and records the
+/// thread of each call.
+struct PrefixCodec {
+    prefix: &'static [u8],
+    out: Vec<u8>,
+    calls: CodecCalls,
+}
+
+impl FrameCodec for PrefixCodec {
+    fn encode_frame(&mut self, chunk: &[u8]) -> Result<&[u8], SinkError> {
+        self.calls.lock().unwrap().push(std::thread::current().id());
+        self.out.clear();
+        self.out.extend_from_slice(self.prefix);
+        self.out.extend_from_slice(chunk);
+        Ok(&self.out)
+    }
+}
+
+fn prefix_codec(prefix: &'static [u8]) -> (FrameCodecFactory, CodecCalls) {
+    let calls = CodecCalls::default();
+    let shared = Arc::clone(&calls);
+    let factory = FrameCodecFactory::new(move || {
+        Box::new(PrefixCodec {
+            prefix,
+            out: Vec::new(),
+            calls: Arc::clone(&shared),
+        })
+    });
+    (factory, calls)
+}
+
+/// A [`FrameCodec`] whose output is the first half of its input, so a coded
+/// frame is shorter than the chunk it came from.
+#[derive(Default)]
+struct HalvingCodec {
+    out: Vec<u8>,
+}
+
+impl FrameCodec for HalvingCodec {
+    fn encode_frame(&mut self, chunk: &[u8]) -> Result<&[u8], SinkError> {
+        self.out.clear();
+        self.out.extend_from_slice(&chunk[..chunk.len() / 2]);
+        Ok(&self.out)
+    }
+}
+
+fn halving_codec() -> FrameCodecFactory {
+    FrameCodecFactory::new(|| Box::new(HalvingCodec::default()))
+}
+
+/// A [`FrameCodec`] that fails its first call fatally and writes `C:` before
+/// the chunk after that.
+#[derive(Default)]
+struct FailOnceCodec {
+    failed: bool,
+    out: Vec<u8>,
+}
+
+impl FrameCodec for FailOnceCodec {
+    fn encode_frame(&mut self, chunk: &[u8]) -> Result<&[u8], SinkError> {
+        if !self.failed {
+            self.failed = true;
+            return Err(SinkError::Client {
+                class: crate::error::ErrorClass::Fatal,
+                reason: "cannot code the chunk".into(),
+            });
+        }
+        self.out.clear();
+        self.out.extend_from_slice(b"C:");
+        self.out.extend_from_slice(chunk);
+        Ok(&self.out)
+    }
+}
+
+/// Each sealed chunk passes through the queues' codec exactly once, on the
+/// thread that pushed the records, and the chunk records the length the
+/// encoder wrote.
+#[test]
+fn a_frame_codec_codes_each_chunk_once_on_the_pipeline_thread() {
+    let (factory, calls) = prefix_codec(b"P:");
+    let (queues, mut rxs) = shard_queues(1, 64);
+    let queues = queues.with_frame_codec(factory);
+    // A 1-byte target seals a chunk after every record.
+    let cfg = ChunkConfig {
+        target_bytes: 1,
+        ..ChunkConfig::default()
+    };
+    let mut c = chain_owned(BytesPassthrough)
+        .sink(
+            VecEncoder,
+            KeyHashRouter,
+            cfg,
+            queues,
+            Arc::new(InflightBudget::new()),
+        )
+        .build();
+
+    let bufs = payloads(&["r0", "r11", "r222"]);
+    let (mut batch, _rx) = TestBatch::new(&bufs);
+    assert!(matches!(c.push_batch(&mut batch, 0), PushOutcome::Done));
+    assert!(matches!(c.flush(), PushOutcome::Done));
+
+    let mut rows = Vec::new();
+    while let Ok(chunk) = rxs[0].try_recv() {
+        let raw = chunk
+            .frame
+            .strip_prefix(b"P:")
+            .expect("every shipped frame is the codec's output");
+        assert_eq!(chunk.raw_len, raw.len(), "raw_len is the encoder's length");
+        rows.extend(decode_rows(raw));
+        chunk.acks.deliver();
+    }
+    assert_eq!(
+        rows,
+        vec![b"r0".to_vec(), b"r11".to_vec(), b"r222".to_vec()]
+    );
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 3, "one codec call per sealed chunk");
+    assert!(
+        calls.iter().all(|&t| t == std::thread::current().id()),
+        "the codec runs on the thread that pushed the records"
+    );
+}
+
+/// The in-flight budget grows by the chunk's length before the codec.
+#[test]
+fn budget_counts_the_frame_before_the_codec() {
+    let (queues, mut rxs) = shard_queues(1, 64);
+    let budget = Arc::new(InflightBudget::new());
+    let mut c = chain_owned(BytesPassthrough)
+        .sink(
+            VecEncoder,
+            KeyHashRouter,
+            ChunkConfig::default(),
+            queues.with_frame_codec(halving_codec()),
+            Arc::clone(&budget),
+        )
+        .build();
+
+    let bufs = payloads(&["0123456789"]);
+    let (mut batch, _rx) = TestBatch::new(&bufs);
+    assert!(matches!(c.push_batch(&mut batch, 0), PushOutcome::Done));
+    assert!(matches!(c.flush(), PushOutcome::Done));
+    let chunk = rxs[0].try_recv().expect("one chunk");
+    assert_eq!(chunk.raw_len, 14);
+    assert_eq!(chunk.frame.len(), 7);
+    assert_eq!(
+        budget.usage(),
+        chunk.raw_len,
+        "the budget counts the chunk before the codec"
+    );
+    chunk.acks.deliver();
+}
+
+/// Tearing the stage down releases each parked chunk's pre-codec length, the
+/// amount its seal added to the budget.
+#[test]
+fn parked_chunks_release_their_raw_bytes_on_drop() {
+    let (queues, mut rxs) = shard_queues(1, 1);
+    let budget = Arc::new(InflightBudget::new());
+    let cfg = ChunkConfig {
+        target_bytes: 1,
+        ..ChunkConfig::default()
+    };
+    let mut c = chain_owned(BytesPassthrough)
+        .sink(
+            VecEncoder,
+            KeyHashRouter,
+            cfg,
+            queues.with_frame_codec(halving_codec()),
+            Arc::clone(&budget),
+        )
+        .build();
+
+    // Two seals: the first fills the one-slot queue, the second parks.
+    let bufs = payloads(&["first", "second"]);
+    let (mut batch, _rx) = TestBatch::new(&bufs);
+    let _ = c.push_batch(&mut batch, 0);
+    drop(c);
+
+    let queued = rxs[0].try_recv().expect("the first chunk is queued");
+    assert_ne!(queued.raw_len, queued.frame.len());
+    assert_eq!(
+        budget.usage(),
+        queued.raw_len,
+        "only the queued chunk's raw bytes stay budgeted"
+    );
+}
+
+/// A codec error stops the pipeline and ships nothing; the chunk's rows and
+/// acknowledgments stay with the shard, so a later seal ships all of them.
+#[test]
+fn a_codec_failure_is_fatal_and_keeps_the_rows() {
+    let (queues, mut rxs) = shard_queues(1, 64);
+    let budget = Arc::new(InflightBudget::new());
+    let mut c = chain_owned(BytesPassthrough)
+        .sink(
+            VecEncoder,
+            KeyHashRouter,
+            ChunkConfig::default(),
+            queues.with_frame_codec(FrameCodecFactory::new(
+                || Box::new(FailOnceCodec::default()),
+            )),
+            Arc::clone(&budget),
+        )
+        .build();
+
+    let first = payloads(&["one"]);
+    let (mut batch, ack_rx) = TestBatch::new(&first);
+    assert!(matches!(c.push_batch(&mut batch, 0), PushOutcome::Done));
+    assert!(matches!(c.flush(), PushOutcome::Fatal(_)));
+    drop(batch);
+    assert!(rxs[0].try_recv().is_err(), "a failed codec ships nothing");
+    assert_eq!(budget.usage(), 0, "nothing shipped, nothing budgeted");
+    assert!(
+        ack_rx.try_recv().is_err(),
+        "the shard still holds the batch's acknowledgment"
+    );
+
+    let second = payloads(&["two"]);
+    let (mut batch, _rx2) = TestBatch::new(&second);
+    assert!(matches!(c.push_batch(&mut batch, 0), PushOutcome::Done));
+    assert!(matches!(c.flush(), PushOutcome::Done));
+    let chunk = rxs[0].try_recv().expect("the second flush ships a chunk");
+    let raw = chunk.frame.strip_prefix(b"C:").expect("coded frame");
+    assert_eq!(decode_rows(raw), vec![b"one".to_vec(), b"two".to_vec()]);
+    assert_eq!(chunk.raw_len, 14, "both rows as the encoder wrote them");
+    assert_eq!(chunk.rows, 2);
+    chunk.acks.deliver();
+    drop(batch);
+    assert_eq!(ack_rx.try_recv().unwrap().status, AckStatus::Delivered);
+}
+
+/// A frame codec failure counts one fatal on the sink stage, however many
+/// times the drain flushes the same rows afterwards.
+#[test]
+fn a_codec_failure_counts_a_fatal_on_the_sink_stage() {
+    /// A codec that fails every call.
+    struct AlwaysFails;
+    impl FrameCodec for AlwaysFails {
+        fn encode_frame(&mut self, _chunk: &[u8]) -> Result<&[u8], SinkError> {
+            Err(SinkError::Client {
+                class: crate::error::ErrorClass::Fatal,
+                reason: "cannot code the chunk".into(),
+            })
+        }
+    }
+    let rendered = crate::metrics::render_local(|| {
+        let (queues, mut rxs) = shard_queues(1, 64);
+        let mut c = chain_owned(OwnedPassthrough)
+            .with_metrics("errtest", "main")
+            .sink(
+                VecEncoder,
+                KeyHashRouter,
+                ChunkConfig::default(),
+                queues.with_frame_codec(FrameCodecFactory::new(|| Box::new(AlwaysFails))),
+                Arc::new(InflightBudget::new()),
+            )
+            .build();
+        let bufs = payloads(&["row"]);
+        let (mut batch, _rx) = TestBatch::new(&bufs);
+        assert!(matches!(c.push_batch(&mut batch, 0), PushOutcome::Done));
+        assert!(matches!(c.flush(), PushOutcome::Fatal(_)));
+        let _ = c.flush();
+        let _ = c.flush();
+        assert!(rxs[0].try_recv().is_err(), "a failed codec ships nothing");
+    });
+    assert_eq!(
+        error_series(&rendered),
+        stage_errors(&stage_labels(0, "sink_handoff"), 0, 1),
+        "a failed codec is one fatal for the sink stage:\n{rendered}"
+    );
+}
+
+/// A row encoder whose `finish_chunk` closes each block with `|END`.
+#[derive(Clone, Default)]
+struct TrailerEncoder;
+
+impl RowEncoder<Owned<Vec<u8>>> for TrailerEncoder {
+    fn encode<'buf>(&mut self, rec: &Record<Vec<u8>>, buf: &mut BytesMut) -> Result<(), SinkError> {
+        buf.extend_from_slice(&rec.payload);
+        Ok(())
+    }
+    fn finish_chunk(&mut self, buf: &mut BytesMut) -> Result<(), SinkError> {
+        buf.extend_from_slice(b"|END");
+        Ok(())
+    }
+}
+
+/// A seal after a codec error ships the block the encoder already finished,
+/// and does not call `finish_chunk` for it again.
+#[test]
+fn a_seal_after_a_codec_error_does_not_finish_the_chunk_again() {
+    let (queues, mut rxs) = shard_queues(1, 64);
+    let mut c = chain_owned(BytesPassthrough)
+        .sink(
+            TrailerEncoder,
+            KeyHashRouter,
+            ChunkConfig::default(),
+            queues.with_frame_codec(FrameCodecFactory::new(
+                || Box::new(FailOnceCodec::default()),
+            )),
+            Arc::new(InflightBudget::new()),
+        )
+        .build();
+
+    let bufs = payloads(&["one"]);
+    let (mut batch, _rx) = TestBatch::new(&bufs);
+    assert!(matches!(c.push_batch(&mut batch, 0), PushOutcome::Done));
+    assert!(matches!(c.flush(), PushOutcome::Fatal(_)));
+    assert!(matches!(c.flush(), PushOutcome::Done));
+    let chunk = rxs[0].try_recv().expect("the second flush ships the chunk");
+    assert_eq!(&chunk.frame[..], b"C:one|END", "one finished block");
+    chunk.acks.deliver();
+}
+
+/// A row pushed after a codec error is finished by the next seal.
+#[test]
+fn a_row_pushed_after_a_codec_error_is_finished_at_the_next_seal() {
+    let (queues, mut rxs) = shard_queues(1, 64);
+    let mut c = chain_owned(BytesPassthrough)
+        .sink(
+            TrailerEncoder,
+            KeyHashRouter,
+            ChunkConfig::default(),
+            queues.with_frame_codec(FrameCodecFactory::new(
+                || Box::new(FailOnceCodec::default()),
+            )),
+            Arc::new(InflightBudget::new()),
+        )
+        .build();
+
+    let first = payloads(&["one"]);
+    let (mut batch, _rx) = TestBatch::new(&first);
+    assert!(matches!(c.push_batch(&mut batch, 0), PushOutcome::Done));
+    assert!(matches!(c.flush(), PushOutcome::Fatal(_)));
+    drop(batch);
+    let second = payloads(&["two"]);
+    let (mut batch, _rx2) = TestBatch::new(&second);
+    assert!(matches!(c.push_batch(&mut batch, 0), PushOutcome::Done));
+    assert!(matches!(c.flush(), PushOutcome::Done));
+    let chunk = rxs[0].try_recv().expect("the second flush ships the chunk");
+    assert_eq!(
+        &chunk.frame[..],
+        b"C:one|ENDtwo|END",
+        "both blocks finished"
+    );
+    chunk.acks.deliver();
+}
+
+/// Once the retried chunk ships, the next chunk is finished at its seal,
+/// even when it holds as many rows as the chunk that failed.
+#[test]
+fn a_chunk_after_a_retried_seal_is_finished() {
+    let (queues, mut rxs) = shard_queues(1, 64);
+    let mut c = chain_owned(BytesPassthrough)
+        .sink(
+            TrailerEncoder,
+            KeyHashRouter,
+            ChunkConfig::default(),
+            queues.with_frame_codec(FrameCodecFactory::new(
+                || Box::new(FailOnceCodec::default()),
+            )),
+            Arc::new(InflightBudget::new()),
+        )
+        .build();
+
+    let first = payloads(&["one"]);
+    let (mut batch, _rx) = TestBatch::new(&first);
+    assert!(matches!(c.push_batch(&mut batch, 0), PushOutcome::Done));
+    assert!(matches!(c.flush(), PushOutcome::Fatal(_)));
+    assert!(matches!(c.flush(), PushOutcome::Done));
+    rxs[0].try_recv().expect("the retried chunk").acks.deliver();
+    drop(batch);
+    let second = payloads(&["two"]);
+    let (mut batch, _rx2) = TestBatch::new(&second);
+    assert!(matches!(c.push_batch(&mut batch, 0), PushOutcome::Done));
+    assert!(matches!(c.flush(), PushOutcome::Done));
+    let chunk = rxs[0].try_recv().expect("the next chunk");
+    assert_eq!(&chunk.frame[..], b"C:two|END", "the next block finished");
+    chunk.acks.deliver();
+}
+
+/// The shard buffer's capacity after one coded row of `payload_len` bytes
+/// seals a chunk against a 1 KiB target.
+fn capacity_after_one_coded_row(payload_len: usize) -> usize {
+    use super::chain::{OpMeter, OpMeterSlot};
+    use crate::record::RecordMeta;
+
+    let (factory, _calls) = prefix_codec(b"");
+    let (queues, _rxs) = shard_queues(1, 64);
+    let cfg = ChunkConfig {
+        target_bytes: 1024,
+        ..ChunkConfig::default()
+    };
+    let mut handoff = SinkHandoff::<Owned<Vec<u8>>, _, _>::new(
+        VecEncoder,
+        ToZero,
+        queues.with_frame_codec(factory),
+        Arc::new(InflightBudget::new()),
+        cfg,
+        OpMeterSlot(OpMeter::new(None)),
+        Arc::from("capacity"),
+    );
+    let (ack, _rx) = AckRef::test_pair();
+    let rec = Record {
+        payload: vec![7u8; payload_len],
+        meta: RecordMeta {
+            partition: PartitionId(0),
+            offset: 0,
+            event_time_ms: 0,
+            key_hash: None,
+        },
+        ack,
+    };
+    assert!(matches!(
+        Collector::push(&mut handoff, rec),
+        crate::record::Flow::Continue
+    ));
+    handoff.buffer_capacity(0)
+}
+
+/// A coded seal keeps a buffer that grew to at most twice the chunk target.
+#[test]
+fn a_coded_seal_keeps_a_buffer_within_twice_the_target() {
+    assert!(capacity_after_one_coded_row(1500) > 1024);
+}
+
+/// A coded seal releases a buffer that one row grew past twice the chunk
+/// target.
+#[test]
+fn an_oversized_row_does_not_pin_its_buffer() {
+    assert_eq!(capacity_after_one_coded_row(2 * 1024), 1024);
+}
+
+/// Each split branch codes with the codec of the queue set it was given.
+#[test]
+fn split_branches_keep_their_queues_codec() {
+    let (sub_codec, _) = prefix_codec(b"S:");
+    let (key_codec, _) = prefix_codec(b"K:");
+    let (sub_q, mut sub_rx) = shard_queues(1, 64);
+    let (key_q, mut key_rx) = shard_queues(1, 64);
+    let budget = Arc::new(InflightBudget::new());
+
+    let mut split = chain(LogDeser).split(ErrorPolicy::Skip);
+    let sub = split.add::<SubF, _, _>(
+        SubEncoder,
+        ToZero,
+        SinkCtx::new(
+            "sub".into(),
+            sub_q.with_frame_codec(sub_codec),
+            Arc::clone(&budget),
+        ),
+    );
+    let key = split.add::<KeyF, _, _>(
+        KeyEncoder,
+        ToZero,
+        SinkCtx::new(
+            "key".into(),
+            key_q.with_frame_codec(key_codec),
+            Arc::clone(&budget),
+        ),
+    );
+    let mut c = split
+        .route(move |e: LogEvent<'_>, out| {
+            if e.key.starts_with('a') {
+                out.emit(sub, SubEvent { chunk: e.body });
+            } else {
+                out.emit(
+                    key,
+                    KeyEvent {
+                        key: e.key.as_bytes(),
+                    },
+                );
+            }
+        })
+        .build();
+
+    let bufs = payloads(&["a1:body-a", "k1:body-k"]);
+    let (mut batch, _ack_rx) = TestBatch::new(&bufs);
+    assert!(matches!(c.push_batch(&mut batch, 0), PushOutcome::Done));
+    assert!(matches!(c.flush(), PushOutcome::Done));
+
+    for (rx, prefix, row) in [
+        (&mut sub_rx[0], &b"S:"[..], &b"body-a"[..]),
+        (&mut key_rx[0], &b"K:"[..], &b"k1"[..]),
+    ] {
+        let chunk = rx.try_recv().expect("each branch ships one chunk");
+        let raw = chunk
+            .frame
+            .strip_prefix(prefix)
+            .expect("the branch's own codec coded the frame");
+        assert_eq!(decode_rows(raw), vec![row.to_vec()]);
+        chunk.acks.deliver();
+    }
 }

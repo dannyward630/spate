@@ -14,10 +14,13 @@ use crate::checkpoint::{AckSet, BatchId};
 use crate::deser::RecFamily;
 use crate::error::{ErrorClass, ErrorPolicy, FatalError, SinkError};
 use crate::record::{Flow, Record};
-use crate::sink::{ChunkSendError, EncodedChunk, RecordRouter, RowEncoder, ShardQueues};
+use crate::sink::{
+    ChunkSendError, EncodedChunk, FrameCodec, RecordRouter, RowEncoder, ShardQueues,
+};
 use crate::telemetry::RateLimit;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use std::collections::VecDeque;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -68,6 +71,21 @@ struct ShardBuf<E> {
     first_ingest: Option<Instant>,
     /// Smallest event time seen in the open chunk (ms since epoch).
     oldest_event_ms: i64,
+    /// `rows` when a codec error left `buf` holding a block the encoder
+    /// already finished. A seal skips `finish_chunk` while `rows` still
+    /// equals it, so no row has been encoded since. A seal with no rows
+    /// returns before it reaches the codec, so the count is never zero.
+    finished_rows: Option<NonZeroU32>,
+}
+
+/// This stage's own [`FrameCodec`] instance. The wrapper gives
+/// [`SinkHandoff`] a `Debug` impl, which the trait does not require.
+struct CodecSlot(Box<dyn FrameCodec>);
+
+impl std::fmt::Debug for CodecSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FrameCodec")
+    }
 }
 
 static ENCODE_SKIP_WARN: RateLimit = RateLimit::new(5, Duration::from_secs(10));
@@ -85,6 +103,8 @@ pub struct SinkHandoff<F: RecFamily, E, R> {
     shards: Vec<ShardBuf<E>>,
     /// Sealed chunks that could not be sent, in seal order.
     parked: VecDeque<(usize, EncodedChunk)>,
+    /// The sink's frame codec, made from `queues` for this stage alone.
+    codec: Option<CodecSlot>,
     pub(crate) meter: OpMeterSlot,
     pub(crate) fatal: FatalSlot,
     component: Arc<str>,
@@ -123,10 +143,13 @@ where
                 last_batch: None,
                 first_ingest: None,
                 oldest_event_ms: i64::MAX,
+                finished_rows: None,
             })
             .collect();
+        let codec = queues.new_frame_codec().map(CodecSlot);
         SinkHandoff {
             router,
+            codec,
             queues,
             budget,
             cfg,
@@ -139,10 +162,11 @@ where
         }
     }
 
-    /// Seal shard `idx`'s buffer into a chunk and try to send it. The
-    /// in-flight budget grows at seal time, because a parked chunk is
-    /// in-flight memory too; the sink worker releases the bytes after the
-    /// batch is written or abandoned.
+    /// Seal shard `idx`'s buffer into a chunk and try to send it. With a
+    /// frame codec, the codec's output becomes the frame. The in-flight
+    /// budget grows at seal time by the length before the codec, because a
+    /// parked chunk is in-flight memory too; the sink worker releases the
+    /// same amount after the batch is written or abandoned.
     fn seal_and_send(&mut self, idx: usize) {
         let shard = &mut self.shards[idx];
         if shard.rows == 0 {
@@ -156,7 +180,9 @@ where
         // later finalize succeeds and fail on teardown otherwise. A flush seals
         // every shard after this one, so the latch keeps the first reason.
         let before = shard.buf.len();
-        if let Err(e) = shard.encoder.finish_chunk(&mut shard.buf) {
+        if shard.finished_rows != NonZeroU32::new(shard.rows)
+            && let Err(e) = shard.encoder.finish_chunk(&mut shard.buf)
+        {
             // The encoder may have written a partial block; roll it back to
             // the rows `encode` wrote, so the frame stays well-formed.
             shard.buf.truncate(before);
@@ -167,16 +193,50 @@ where
             });
             return;
         }
-        let frame = shard.buf.split().freeze();
-        // `split()` left the emptied buffer sharing the frozen frame's
-        // allocation, so growing it in place is impossible while that frame is
-        // in flight. Reserve a fresh target-sized allocation now (one alloc
-        // per seal) so the next chunk accumulates without repeatedly
-        // reallocating and copying the partial frame.
-        shard.buf.reserve(self.cfg.target_bytes);
-        self.budget.add(frame.len());
+        let (frame, raw_len) = match &mut self.codec {
+            None => {
+                let frame = shard.buf.split().freeze();
+                // `split()` left the emptied buffer sharing the frozen frame's
+                // allocation, so growing it in place is impossible while that
+                // frame is in flight. Reserve a fresh target-sized allocation
+                // now (one alloc per seal) so the next chunk accumulates
+                // without repeatedly reallocating and copying the partial
+                // frame.
+                shard.buf.reserve(self.cfg.target_bytes);
+                let raw_len = frame.len();
+                (frame, raw_len)
+            }
+            Some(CodecSlot(codec)) => match codec.encode_frame(&shard.buf) {
+                Ok(coded) => {
+                    let frame = Bytes::copy_from_slice(coded);
+                    let raw_len = shard.buf.len();
+                    // The frame is a copy, so the buffer is reused in place.
+                    shard.buf.clear();
+                    shard.finished_rows = None;
+                    // One oversized row would otherwise keep its buffer for
+                    // the life of the chain.
+                    if shard.buf.capacity() > 2 * self.cfg.target_bytes {
+                        shard.buf = BytesMut::with_capacity(self.cfg.target_bytes);
+                    }
+                    (frame, raw_len)
+                }
+                Err(e) => {
+                    // The finished block stays in the buffer, so the rows and
+                    // acks stay with the shard as on a failed finalize.
+                    shard.finished_rows = NonZeroU32::new(shard.rows);
+                    self.meter.0.fatal_error();
+                    self.fatal.0.get_or_insert_with(|| FatalError {
+                        component: self.component.to_string(),
+                        reason: e.to_string(),
+                    });
+                    return;
+                }
+            },
+        };
+        self.budget.add(raw_len);
         let chunk = EncodedChunk {
             frame,
+            raw_len,
             rows: shard.rows,
             acks: std::mem::take(&mut shard.acks),
             oldest_ingest: shard.first_ingest.take().unwrap_or_else(Instant::now),
@@ -204,17 +264,23 @@ where
         }
         true
     }
+
+    /// Capacity of shard `idx`'s accumulation buffer.
+    #[cfg(test)]
+    pub(crate) fn buffer_capacity(&self, idx: usize) -> usize {
+        self.shards[idx].buf.capacity()
+    }
 }
 
 /// Teardown safety: un-sent output (parked chunks after a drain deadline,
 /// partial shard buffers) holds its acknowledgments in fail-on-drop
 /// [`AckSet`]s, so tearing the handoff down stalls those watermarks and the
 /// records replay after restart. This `Drop` reconciles only the in-flight
-/// byte budget for parked chunks (their bytes were added at seal time).
+/// byte budget for parked chunks (their `raw_len` was added at seal time).
 impl<F: RecFamily, E, R> Drop for SinkHandoff<F, E, R> {
     fn drop(&mut self) {
         for (_, chunk) in self.parked.drain(..) {
-            self.budget.sub(chunk.frame.len());
+            self.budget.sub(chunk.raw_len);
         }
     }
 }
