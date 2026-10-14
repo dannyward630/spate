@@ -674,3 +674,155 @@ mod first_record_check {
         assert_eq!(owned_buf, ref_buf);
     }
 }
+
+// The terminal stage seals a chunk on `buffered_bytes`, so the encoder's size
+// must be the length of the block it would write.
+mod block_size {
+    use super::*;
+    use bytes::BytesMut;
+    use spate_core::sink::RowEncoder;
+    use spate_test::record;
+    use std::collections::BTreeMap;
+
+    const COLUMNS: &[(&str, &str)] = &[
+        ("id", "UInt64"),
+        ("url", "String"),
+        ("referrer", "Nullable(String)"),
+        ("code", "FixedString(8)"),
+        ("peer", "IPv6"),
+        ("sizes", "Array(UInt32)"),
+        ("attrs", "Map(String, UInt64)"),
+        ("span", "Tuple(String, UInt32)"),
+        ("country", "LowCardinality(String)"),
+        ("city", "LowCardinality(String)"),
+        ("tier", "LowCardinality(Nullable(String))"),
+        ("tags", "Array(LowCardinality(String))"),
+    ];
+
+    #[derive(Serialize)]
+    struct Row {
+        id: u64,
+        url: String,
+        referrer: Option<String>,
+        code: String,
+        peer: std::net::Ipv6Addr,
+        sizes: Vec<u32>,
+        attrs: BTreeMap<String, u64>,
+        span: (String, u32),
+        country: String,
+        city: String,
+        tier: Option<String>,
+        tags: Vec<String>,
+    }
+
+    /// Row `i`: `city` is distinct on every row, so its dictionary crosses
+    /// the 256-entry boundary where keys widen to two bytes. `tags` is empty
+    /// for the first rows, so its keys start out empty.
+    fn row(i: u64) -> Row {
+        Row {
+            id: i,
+            url: format!("https://example.com/{i}"),
+            referrer: (!i.is_multiple_of(3)).then(|| format!("ref-{i}")),
+            code: ["us", "gb-1", "jp-tokyo"][i as usize % 3].into(),
+            peer: std::net::Ipv6Addr::LOCALHOST,
+            sizes: (0..i % 4).map(|n| n as u32).collect(),
+            attrs: (0..i % 3).map(|n| (format!("k{n}"), n)).collect(),
+            span: (format!("s{i}"), i as u32),
+            country: ["US", "GB", "DE"][i as usize % 3].into(),
+            city: format!("city-{i}"),
+            tier: (!i.is_multiple_of(7)).then(|| ["free", "pro"][i as usize % 2].into()),
+            tags: if i < 4 {
+                Vec::new()
+            } else {
+                vec!["a".into(), format!("t{}", i % 5)]
+            },
+        }
+    }
+
+    /// The encoder's buffered size equals the length of the block it emits,
+    /// for every row count up to past the two-byte key boundary.
+    /// Regression for #1139.
+    #[test]
+    fn buffered_size_is_the_emitted_block_length() {
+        for rows in [1, 2, 4, 5, 17, 255, 256, 257, 300] {
+            let mut enc = NativeEncoder::<Owned<Row>>::new(schema(COLUMNS));
+            let mut buf = BytesMut::new();
+            for i in 0..rows {
+                enc.encode(&record(row(i)), &mut buf).expect("row encodes");
+            }
+            let size = enc.compute_buffered();
+            enc.finish_chunk(&mut buf).expect("finish");
+            assert_eq!(size, buf.len(), "{rows} rows");
+        }
+    }
+
+    /// A column type name of 128 bytes or more takes a two-byte length
+    /// prefix in the block header, and the buffered size counts it.
+    #[test]
+    fn buffered_size_counts_a_two_byte_header_prefix() {
+        #[derive(Serialize)]
+        struct Level {
+            v: i8,
+        }
+        let enum_type = format!(
+            "Enum8({})",
+            (0..12)
+                .map(|n| format!("'variant_{n:02}' = {n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(enum_type.len() >= 128);
+        let mut enc = NativeEncoder::<Owned<Level>>::new(schema(&[("v", &enum_type)]));
+        let mut buf = BytesMut::new();
+        enc.encode(&record(Level { v: 1 }), &mut buf)
+            .expect("row encodes");
+        let size = enc.compute_buffered();
+        enc.finish_chunk(&mut buf).expect("finish");
+        assert_eq!(size, buf.len());
+    }
+
+    /// A schema of 128 columns or more takes a two-byte column count in the
+    /// block header, and the buffered size counts it.
+    #[test]
+    fn buffered_size_counts_a_two_byte_column_count() {
+        let names: Vec<String> = (0..130).map(|n| format!("c{n}")).collect();
+        let cols: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "UInt8")).collect();
+        let mut enc = NativeEncoder::<Owned<Vec<u8>>>::new(schema(&cols));
+        let mut buf = BytesMut::new();
+        enc.encode(&record(vec![1u8; cols.len()]), &mut buf)
+            .expect("row encodes");
+        let size = enc.compute_buffered();
+        enc.finish_chunk(&mut buf).expect("finish");
+        assert_eq!(size, buf.len());
+    }
+
+    /// Sealing on `buffered_bytes` the way the terminal stage does yields
+    /// blocks of at least the target, overshooting by under one refresh
+    /// interval of rows. Regression for #1139.
+    #[test]
+    fn a_64_kib_target_seals_blocks_of_at_least_64_kib() {
+        const TARGET: usize = 64 * 1024;
+        let mut enc = NativeEncoder::<Owned<Row>>::new(schema(COLUMNS));
+        let mut blocks = Vec::new();
+        let mut rows_in_block = 0;
+        for i in 0..20_000 {
+            let mut buf = BytesMut::new();
+            enc.encode(&record(row(i)), &mut buf).expect("row encodes");
+            rows_in_block += 1;
+            if enc.buffered_bytes() >= TARGET {
+                enc.finish_chunk(&mut buf).expect("finish");
+                blocks.push((buf.len(), rows_in_block));
+                rows_in_block = 0;
+            }
+        }
+        assert!(blocks.len() > 2, "the corpus seals several blocks");
+        for (len, rows) in blocks {
+            // Under 16 rows of overshoot, at the mean row size.
+            let slack = 16 * len / rows;
+            assert!(
+                (TARGET..TARGET + slack).contains(&len),
+                "block of {len} bytes over {rows} rows for a {TARGET}-byte target"
+            );
+        }
+    }
+}
