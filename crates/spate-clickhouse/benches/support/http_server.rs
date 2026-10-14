@@ -16,7 +16,8 @@
 //! - anything else gets plain RowBinary.
 //!
 //! An insert body is read frame by frame and discarded, and the server
-//! answers `200` once the body ends. A server built with [`BenchServer::recording`]
+//! answers `200` once the body ends, or the exception a server built with
+//! [`BenchServer::failing_inserts`] was given. A server built with [`BenchServer::recording`]
 //! keeps each request's query pairs, headers and body instead, for tests.
 //! The benches never record.
 //!
@@ -34,7 +35,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use spate_clickhouse::config::{self, ClickHouseSinkConfig};
+use spate_clickhouse::config::{self, ClickHouseSink, ClickHouseSinkConfig};
 use spate_clickhouse::testing::{ColumnRow, system_columns};
 use spate_clickhouse::{ClickHouseEndpoint, ClickHouseWriter, serialize_row};
 use spate_core::deser::Owned;
@@ -71,6 +72,8 @@ struct State {
     /// The `system.columns` answer as plain RowBinaryWithNamesAndTypes.
     columns: Bytes,
     recorded: Option<Mutex<Vec<Recorded>>>,
+    /// The exception code and body every insert is answered with, as `500`.
+    insert_error: Option<(u32, Bytes)>,
 }
 
 /// A running server on `127.0.0.1` and an OS-chosen port. Dropping it stops
@@ -85,20 +88,28 @@ impl BenchServer {
     /// A server that answers the schema query with `columns`, as
     /// `(name, type)` pairs in table order, and discards every insert.
     pub(crate) fn discarding(columns: &[(&str, &str)]) -> Self {
-        Self::start(columns, false)
+        Self::start(columns, false, None)
     }
 
     /// A server like [`BenchServer::discarding`] that also records every
     /// request.
     pub(crate) fn recording(columns: &[(&str, &str)]) -> Self {
-        Self::start(columns, true)
+        Self::start(columns, true, None)
     }
 
-    fn start(columns: &[(&str, &str)], record: bool) -> Self {
+    /// A server like [`BenchServer::recording`] that answers every insert
+    /// `500` with exception `code` in `X-ClickHouse-Exception-Code` and
+    /// `body` as the response body, as ClickHouse reports a failed insert.
+    pub(crate) fn failing_inserts(columns: &[(&str, &str)], code: u32, body: &str) -> Self {
+        Self::start(columns, true, Some((code, Bytes::from(body.to_owned()))))
+    }
+
+    fn start(columns: &[(&str, &str)], record: bool, insert_error: Option<(u32, Bytes)>) -> Self {
         let specs: Vec<(&str, &str, &str)> = columns.iter().map(|(n, t)| (*n, *t, "")).collect();
         let state = Arc::new(State {
             columns: columns_answer(&system_columns(&specs)),
             recorded: record.then(|| Mutex::new(Vec::new())),
+            insert_error,
         });
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -173,21 +184,7 @@ pub(crate) async fn events_sink(
     url: &str,
     compression: &str,
 ) -> (ClickHouseWriter, ClickHouseEndpoint) {
-    let cfg: ClickHouseSinkConfig = serde_yaml::from_str(&format!(
-        r#"
-table: events
-format: native
-compression: "{compression}"
-shards:
-  - replicas: ["{url}"]
-"#
-    ))
-    .expect("config yaml");
-    let sink = config::build(cfg)
-        .expect("valid sink config")
-        .with_row::<Owned<EventRow>>()
-        .await
-        .expect("the schema fetch");
+    let sink = events_sink_in(url, compression, "native").await;
     let endpoint = sink
         .endpoints
         .into_iter()
@@ -195,6 +192,30 @@ shards:
         .and_then(|replicas| replicas.into_iter().next())
         .expect("one shard with one replica");
     (sink.writer, endpoint)
+}
+
+/// A one-replica sink over the `events` table at `url` in `format`
+/// (`rowbinary` or `native`), built as [`events_sink`] builds it.
+///
+/// # Panics
+///
+/// Panics when the config is invalid or the schema fetch fails.
+pub(crate) async fn events_sink_in(url: &str, compression: &str, format: &str) -> ClickHouseSink {
+    let cfg: ClickHouseSinkConfig = serde_yaml::from_str(&format!(
+        r#"
+table: events
+format: {format}
+compression: "{compression}"
+shards:
+  - replicas: ["{url}"]
+"#
+    ))
+    .expect("config yaml");
+    config::build(cfg)
+        .expect("valid sink config")
+        .with_row::<Owned<EventRow>>()
+        .await
+        .expect("the schema fetch")
 }
 
 /// `rows` as ClickHouse answers `FORMAT RowBinaryWithNamesAndTypes`: the
@@ -262,7 +283,13 @@ async fn answer(
 
     let insert = query.iter().any(|(k, _)| k == "query");
     let flag = |name: &str| query.iter().any(|(k, v)| k == name && v == "1");
-    let response = if insert {
+    let response = if let (true, Some((code, body))) = (insert, &state.insert_error) {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header("x-clickhouse-exception-code", code.to_string())
+            .body(Full::new(body.clone()))
+            .expect("a valid response")
+    } else if insert {
         status(StatusCode::OK)
     } else if flag("compress") {
         let block = clickhouse::_priv::lz4_compress(&state.columns).expect("lz4 frames the answer");
