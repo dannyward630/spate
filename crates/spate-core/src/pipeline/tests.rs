@@ -1057,6 +1057,78 @@ fn caller_owned_io_runtime_is_used_and_shut_down_by_run() {
     );
 }
 
+/// A caller-owned current-thread I/O runtime fails `run` with
+/// `StartError::Config` before any pipeline thread starts. Regression for
+/// #1155.
+#[test]
+fn current_thread_io_runtime_fails_startup() {
+    let io = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (queues, receivers) = shard_queues(1, 8);
+    let drain: super::SinkDrainFn = Box::new(move |_budget| {
+        Box::pin(async move {
+            let _receivers = receivers;
+            DrainReport::default()
+        })
+    });
+    let sink = SinkRuntime {
+        queues: vec![queues],
+        drain,
+        probe: None,
+        failures: SinkFailures::new(),
+    };
+
+    let (source, shared, _script) = FakeSource::new();
+    let chain_shared = Arc::new(ChainShared::default());
+    let log = Arc::new(Mutex::new(SourceLog::default()));
+    let chains_built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let chains_built_in = Arc::clone(&chains_built);
+    let runtime = PipelineRuntime::new(
+        test_config(1),
+        source,
+        move |_thread| {
+            chains_built_in.fetch_add(1, Ordering::Relaxed);
+            Box::new(FakeChain {
+                shared: Arc::clone(&chain_shared),
+                log: Arc::clone(&log),
+                mode: ChainMode::Ok,
+                batches_seen: 0,
+            }) as Box<dyn RunnableChain>
+        },
+        sink,
+        Arc::new(crate::backpressure::InflightBudget::new()),
+    )
+    .with_options(test_options())
+    .with_io_runtime(io);
+    // Without the check, a pre-triggered shutdown lets `run` drain and
+    // return `Ok`, so the assertion below fails instead of hanging.
+    runtime.shutdown_handle().trigger();
+    let (result, rendered) = std::thread::spawn(move || {
+        let mut result = None;
+        let rendered = crate::metrics::render_local(|| result = Some(runtime.run()));
+        (result.expect("run returned"), rendered)
+    })
+    .join()
+    .unwrap();
+
+    let Err(err @ StartError::Config(_)) = result else {
+        panic!("expected StartError::Config, got {result:?}");
+    };
+    assert!(err.to_string().contains("multi-thread"), "{err}");
+    assert!(!shared.lock().unwrap().opened, "the source must not open");
+    assert_eq!(
+        chains_built.load(Ordering::Relaxed),
+        0,
+        "no pipeline thread may start"
+    );
+    assert!(
+        !rendered.contains(names::PIPELINE_STATE),
+        "a refused runtime must register no series:\n{rendered}"
+    );
+}
+
 /// The source drops while the io runtime still runs, so work its `Drop`
 /// spawns there completes. Regression for #854.
 #[test]
