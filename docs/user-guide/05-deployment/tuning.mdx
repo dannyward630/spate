@@ -63,10 +63,20 @@ The process splits work between two pools
   on the controller thread.
 
 When `pipeline.threads` is unset, the count derives at startup as
-`available_parallelism` minus the I/O reserve (the `io_threads` workers plus
-one controller thread), floored at 1. `available_parallelism` respects
-cgroup CPU quotas, so a Kubernetes CPU **limit** sizes this correctly on its
-own.
+`available_parallelism` minus the I/O reserve, floored at 1. The I/O reserve
+is one core for every two `io_threads` workers, rounded up, plus one core for
+the controller thread. Row encoding runs on the pipeline threads, and so does
+compression when the sink supplies a frame codec. The I/O workers carry the
+socket writes. With the default `io_threads: 2`:
+
+| `available_parallelism` | I/O reserve | Pipeline threads |
+|---|---|---|
+| 4 | 2 | 2 |
+| 8 | 2 | 6 |
+| 32 | 2 | 30 |
+
+`available_parallelism` respects cgroup CPU quotas, so a Kubernetes CPU
+**limit** sizes this correctly on its own.
 
 :::warning
 A pod without a CPU limit sees the **node's** cores and spawns that many
@@ -75,8 +85,10 @@ explicitly.
 :::
 
 Raise `io_threads` only if you have many shards with slow, concurrent
-writes; the hot path never runs there, so extra I/O workers buy nothing for
-CPU-bound pipelines and eat into the derived pipeline-thread count.
+writes. The hot path never runs there, so extra I/O workers buy nothing for
+CPU-bound pipelines. Each odd-numbered worker (the first, the third, and so
+on) takes one core from the derived pipeline-thread count, down to its floor
+of 1.
 
 ## Sink batching: `batch.max_rows` / `batch.max_bytes` / `batch.linger`
 
