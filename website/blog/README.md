@@ -7,8 +7,8 @@ one. The site build leaves it out.
 
 Every minor release, `X.Y.0`, has a post. A patch release has none.
 
-The file is `YYYY-MM-DD-spate-X-Y.md`, dated for the release day, with this
-front matter:
+The file is `YYYY-MM-DD-spate-X-Y.md`, or `.mdx` when the post renders a
+component, dated for the release day, with this front matter:
 
 ```yaml
 ---
@@ -48,7 +48,10 @@ one the release dispatches, and the GitHub release body links it.
   output shows.
 - **A performance claim** shows the before and the after on the same setup,
   names the hardware and the number of runs, and says which benchmark tier
-  proves it.
+  proves it. A few figures compared side by side can be drawn with the grouped
+  bar chart in `src/components/charts/`, whose caption states them in words.
+  The feeds drop every inline drawing and its legend, so a figure's caption
+  must carry its content in words.
 - **A fix worth telling** is a short arc in place of a feature section: the
   symptom, the cause, the fix, and the proof.
 - **A credit line** under a highlight that someone other than the author
@@ -71,6 +74,8 @@ The posts already in this directory are the reference.
 - Short, plain sentences. A long one is fine between short ones.
 - Concrete numbers from real runs, including what did not work.
 - No marketing: no pitch, no sign-up prompt, no emoji.
+- Say what changed since the last release. "Now" and "will" are fine in a
+  post.
 - State what is. No "X, not Y" contrasts, no hedging, no adjectives that grade
   the work, and nothing that tells the reader how to feel about it.
 
