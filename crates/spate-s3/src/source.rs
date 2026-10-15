@@ -15,8 +15,9 @@
 //! progress commits; the coordination store is the source's **only**
 //! progress store.
 //!
-//! A source given a feed through the `testing`-gated `with_feed` reads work
-//! units through `unit_reader::UnitReader` in place of all of the above.
+//! A source given a feed, by the pipeline's `feed:` section or through the
+//! `testing`-gated `with_feed`, reads work units through
+//! `unit_reader::UnitReader` in place of all of the above.
 //!
 //! No coordination backend appears in this crate's public API or in its
 //! cargo features. The store comes from the `coordination:` section through
@@ -38,7 +39,7 @@ use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::{ClientConfigKey, ObjectStore, ObjectStoreScheme};
 use spate_coordination::store::memory::MemoryStore;
 use spate_coordination::{CoordinationConfig, CoordinatorSpec, StoreCoordinator};
-use spate_core::config::{ComponentConfig, ConfigError, CoordinationSection};
+use spate_core::config::{ComponentConfig, ConfigError, CoordinationSection, FeedSection};
 use spate_core::coordination::driver::CoordinationDriver;
 use spate_core::coordination::{PlanFinality, SplitCoordinator};
 use spate_core::error::{ErrorClass, SourceError};
@@ -47,6 +48,7 @@ use spate_core::framing::{FramingContract, RecordFramer};
 use spate_core::metrics::CoordinationMetrics;
 use spate_core::record::PartitionId;
 use spate_core::source::{LaneId, Source, SourceCtx, SourceEvent};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
@@ -89,8 +91,11 @@ pub struct S3Source {
     spec: Option<CoordinatorSpec>,
     /// A data store injected via the `testing`-gated `with_store` seam.
     store: Option<Arc<dyn ObjectStore>>,
-    /// A feed injected via the `testing`-gated `with_feed` seam.
+    /// The feed to read units from: the one the `feed:` section names, or
+    /// one injected via the `testing`-gated `with_feed` seam.
     feed: Option<Arc<dyn Feed>>,
+    /// The `feed:` section's `units_held`.
+    units_held: Option<NonZeroUsize>,
     state: State,
 }
 
@@ -122,6 +127,7 @@ impl S3Source {
             spec: None,
             store: None,
             feed: None,
+            units_held: None,
             state: State::Created,
         }
     }
@@ -194,9 +200,9 @@ impl S3Source {
     /// Test seam: read one-object work units from `feed` in place of
     /// coordinated splits. Each unit's body is a [`SplitDescriptor`] naming
     /// one whole object; a unit naming anything else is failed back to the
-    /// feed. Conflicts with [`with_coordinator`](S3Source::with_coordinator)
-    /// and with a `coordination:` section, and never reports the input
-    /// drained, so the run ends at a shutdown.
+    /// feed. Conflicts with [`with_coordinator`](S3Source::with_coordinator),
+    /// with a `coordination:` section and with a `feed:` section, and never
+    /// reports the input drained, so the run ends at a shutdown.
     ///
     /// Behind the off-by-default `testing` feature, outside the semver
     /// surface.
@@ -242,6 +248,32 @@ impl Source for S3Source {
             });
         }
         self.spec = Some(CoordinatorSpec::from_section(section)?);
+        Ok(())
+    }
+
+    fn configure_feed(
+        &mut self,
+        section: &FeedSection,
+        feed: Arc<dyn Feed>,
+    ) -> Result<(), ConfigError> {
+        if self.feed.is_some() {
+            return Err(ConfigError::Component {
+                context: "feed".into(),
+                message: "the S3 source was also given a feed with `with_feed`; \
+                          remove the `feed:` section or drop `with_feed`"
+                    .into(),
+            });
+        }
+        if self.coordinator.is_some() {
+            return Err(ConfigError::Component {
+                context: "feed".into(),
+                message: "the S3 source was also given a coordinator with `with_coordinator`; \
+                          remove the `feed:` section or drop `with_coordinator`"
+                    .into(),
+            });
+        }
+        self.feed = Some(feed);
+        self.units_held = section.units_held;
         Ok(())
     }
 
@@ -308,7 +340,12 @@ impl Source for S3Source {
                 retry_base: RETRY_BASE,
                 metrics,
             };
-            self.state = State::Feed(Box::new(UnitReader::new(feed, parts)));
+            tracing::warn!(
+                feed = feed.backend(),
+                "the S3 source publishes no units of its own and reads only units published to \
+                 the feed"
+            );
+            self.state = State::Feed(Box::new(UnitReader::new(feed, parts, self.units_held)));
             return Ok(());
         }
         // Coordination metrics are constructor-injected (there is no later
