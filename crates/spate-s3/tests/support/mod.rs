@@ -4,6 +4,7 @@
 #![expect(deprecated, reason = "v0.4.0 removes this with spate-coordination")]
 
 pub(crate) mod rustfs;
+pub(crate) mod s3_stub;
 pub(crate) mod spy;
 
 use object_store::ObjectStoreExt as _;
@@ -47,6 +48,17 @@ impl PipelineYaml {
     pub(crate) fn bucket(name: &str, gw: &rustfs::Gateway) -> Self {
         let url = format!("s3://{}/data/", gw.bucket);
         Self::over(name, url, Some(gw.store_options_yaml()))
+    }
+
+    /// Reads `data/` in bucket `b` of the plain-HTTP S3 endpoint `endpoint`,
+    /// with static test credentials.
+    pub(crate) fn endpoint(name: &str, endpoint: &str) -> Self {
+        let store = format!(
+            "      endpoint: \"{endpoint}\"\n      allow_http: \"true\"\n      \
+             access_key_id: \"AKIDTEST\"\n      secret_access_key: \"secret\"\n      \
+             region: \"us-east-1\""
+        );
+        Self::over(name, "s3://b/data/".to_owned(), Some(store))
     }
 
     fn over(name: &str, url: String, store: Option<String>) -> Self {
