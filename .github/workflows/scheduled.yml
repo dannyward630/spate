@@ -176,6 +176,104 @@ jobs:
               'Closing this issue without doing one of them just reopens it tomorrow.'
           )"
 
+  osv:
+    name: Advisories (OSV)
+    runs-on: ubuntu-latest
+    needs: plan
+    if: needs.plan.outputs.nightly == 'true'
+    timeout-minutes: 20
+    # cargo-deny reads only the crates the workspace compiles. This reads every
+    # package in every tracked manifest, including lockfile entries no build
+    # compiles and the site's npm tree. OpenSSF Scorecard counts that same set.
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      # Submodules stay unchecked-out: each is its own repository with its own
+      # scan.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: osv-scanner
+      # Each manifest's findings are filtered by the `osv-scanner.toml` in its
+      # directory. `--no-resolve` scans the versions a manifest names: resolving
+      # a requirements file with no lockfile picks versions no install would.
+      # Exit 1 is a finding. Any other non-zero code is an error such as an
+      # unreachable API or an invalid config, and the report may still list
+      # advisories, so the code goes to the report step to state.
+      - id: scan
+        run: |
+          rc=0
+          osv-scanner scan source --recursive --no-resolve \
+            --format markdown --output-file "$RUNNER_TEMP/osv.md" . || rc=$?
+          echo "rc=$rc" >>"$GITHUB_OUTPUT"
+          exit "$rc"
+
+      # Files only when the scan step fails, so an earlier failure such as the
+      # install does not file an issue for a scan that never ran. The body
+      # follows the sections of the bug issue form.
+      - name: Report the failure as an issue
+        if: failure() && steps.scan.conclusion == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ github.sha }}
+          RC: ${{ steps.scan.outputs.rc }}
+        run: |
+          set -euo pipefail
+          title='[bug] Nightly OSV scan is failing'
+          body="$RUNNER_TEMP/body.md"
+          output() {
+            if [ -s "$RUNNER_TEMP/osv.md" ]; then
+              cat "$RUNNER_TEMP/osv.md"
+            else
+              echo 'The scan wrote no report. The run log has its output.'
+            fi
+          }
+          matches=$(gh issue list --state open --search "$title in:title" --json number,title)
+          existing=$(jq -r --arg t "$title" 'map(select(.title == $t)) | .[0].number // empty' <<<"$matches")
+          if [ -n "$existing" ]; then
+            {
+              printf 'Still failing at %s, exit %s: %s\n' "$SHA" "$RC" "$RUN_URL"
+              output
+            } >"$body"
+            gh issue comment "$existing" --body-file "$body"
+            exit 0
+          fi
+          # Single quotes: the body's backticks must reach GitHub rather than
+          # run as command substitutions.
+          # shellcheck disable=SC2016
+          {
+            printf '%s\n' \
+              '### Where' \
+              '' \
+              'The `Advisories (OSV)` job of the nightly scheduled run.' \
+              '' \
+              '### Version' \
+              '' \
+              "\`main\` at ${SHA}" \
+              '' \
+              '### What happened' \
+              '' \
+              "\`osv-scanner scan source --recursive --no-resolve .\` exited ${RC}. Exit 1 means it reported the advisories under Output; any other code is an error in the run log. Run: ${RUN_URL}" \
+              '' \
+              '### What you expected instead' \
+              '' \
+              'No advisory without an entry in the `osv-scanner.toml` beside the manifest that holds it. On exit 1, triage is one of two things: upgrade the affected package, or add a dated `IgnoredVulns` entry with a written reason, and closing this issue without doing one of them just reopens it tomorrow. On any other exit code, the run log shows the error to fix.' \
+              '' \
+              '### Output' \
+              ''
+            output
+          } >"$body"
+          # `gh issue create` applies `--type` after creating the issue, so a
+          # refused type would fail the step with the URL unprinted. The type is
+          # set afterwards, and a refusal leaves the issue for a person to fix.
+          url=$(gh issue create --title "$title" --body-file "$body")
+          gh issue edit "$url" --type Bug ||
+            echo "::warning::Could not set the type on $url; set it to Bug by hand."
+
   fuzz:
     name: Fuzz targets
     runs-on: ubuntu-latest
@@ -989,7 +1087,7 @@ jobs:
           done <"$out.routes"
 
   # ===========================================================================
-  # Catch-all failure reporting. `attribution`, `advisories`, `fuzz`,
+  # Catch-all failure reporting. `attribution`, `advisories`, `osv`, `fuzz`,
   # `minimal-versions`, `publish-dry-run`, `beta` and `fault-test` file their
   # own issues and are absent from `needs` below so they are not reported twice.
   # ===========================================================================
