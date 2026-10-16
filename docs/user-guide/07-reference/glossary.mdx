@@ -272,8 +272,9 @@ next healthy replica.
 The sink's write and retry unit (`SealedBatch`): concatenated pre-encoded
 frames plus row/byte counts and a [dedup token](#dedup-token). A shard worker
 seals when `batch.max_rows`, `batch.max_bytes`, or `batch.linger` trips, then
-writes it via the `ShardWriter`. The framework resolves the batch's
-acknowledgments only when the writer returns `Ok`, the durable-ack point.
+writes it via the `ShardWriter`. The framework delivers the batch's
+acknowledgments only after the writer returns `Ok`, the durable-ack point, and
+fails them if the batch is abandoned.
 
 ### Shard
 
