@@ -237,6 +237,11 @@ impl KafkaFeedConfig {
                 return Err(error(format!("`{key}` must not be empty")));
             }
         }
+        // A message read from the work topic counts under its own
+        // coordinates, so a retry copy written there would start a new count.
+        if self.retry_topic == self.topic {
+            return Err(error("`retry_topic` must differ from `topic`".to_owned()));
+        }
         if self.delivery_timeout.as_millis() == 0 {
             return Err(error(
                 "`delivery_timeout` must be at least 1ms: librdkafka reads 0 as no timeout, and \
@@ -308,6 +313,25 @@ impl KafkaFeedConfig {
     pub(crate) fn admin_config(&self, openssl_env: bool) -> rdkafka::ClientConfig {
         let mut cc = self.client_config(openssl_env);
         cc.remove("statistics.interval.ms");
+        cc
+    }
+
+    /// The attempt follower's librdkafka configuration: the passthrough,
+    /// then the properties the feed owns, which win, with no statistics.
+    ///
+    /// The follower joins the feed's group by `group.id` only: librdkafka
+    /// refuses `assign` on a consumer with no group. It assigns its
+    /// partitions itself, so it never takes part in a rebalance, and it
+    /// commits nothing.
+    pub(crate) fn follower_config(&self, openssl_env: bool) -> rdkafka::ClientConfig {
+        let mut cc = self.client_config(openssl_env);
+        // Statistics come back once the follower's numbers have a reader.
+        cc.remove("statistics.interval.ms");
+        cc.set("group.id", &self.group_id);
+        cc.set("auto.offset.reset", "earliest");
+        cc.set("enable.auto.commit", "false");
+        cc.set("enable.auto.offset.store", "false");
+        cc.set("enable.partition.eof", "false");
         cc
     }
 
@@ -487,6 +511,19 @@ mod tests {
         }
     }
 
+    /// Pins that a retry topic named like the work topic is refused: a retry
+    /// copy read from the work topic would count under its own coordinates.
+    #[test]
+    fn a_retry_topic_that_is_the_work_topic_is_refused() {
+        let err = parse(&MINIMAL.replace("units-retry", "units"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`retry_topic` must differ from `topic`"),
+            "{err}"
+        );
+    }
+
     /// Pins that a statistics interval under a millisecond is refused, since
     /// librdkafka would read it as off, and that 0s and 1ms are accepted.
     #[test]
@@ -562,6 +599,42 @@ mod tests {
             quiet.producer_config(true).get("statistics.interval.ms"),
             None
         );
+    }
+
+    /// Pins the follower's settings: the feed's group, the four keys that
+    /// keep it a reader that commits nothing, over a passthrough that sets
+    /// them otherwise, and no statistics.
+    #[test]
+    fn the_follower_config_joins_the_feeds_group_and_only_reads() {
+        let mut config = parse(&format!(
+            "{MINIMAL}  statistics_interval: 5s\n  \
+             rdkafka:\n    session.timeout.ms: \"6000\"\n"
+        ))
+        .unwrap();
+        // Built by hand: validation refuses these keys in the passthrough.
+        for (key, value) in [
+            ("group.id", "other"),
+            ("auto.offset.reset", "latest"),
+            ("enable.auto.commit", "true"),
+            ("enable.auto.offset.store", "true"),
+            ("enable.partition.eof", "true"),
+        ] {
+            config.rdkafka.insert(key.to_owned(), value.to_owned());
+        }
+        let follower = config.follower_config(true);
+        for (key, value) in [
+            ("bootstrap.servers", "localhost:9092"),
+            ("group.id", "workers"),
+            ("auto.offset.reset", "earliest"),
+            ("enable.auto.commit", "false"),
+            ("enable.auto.offset.store", "false"),
+            ("enable.partition.eof", "false"),
+            ("allow.auto.create.topics", "false"),
+            ("session.timeout.ms", "6000"),
+        ] {
+            assert_eq!(follower.get(key), Some(value), "follower {key}");
+        }
+        assert_eq!(follower.get("statistics.interval.ms"), None);
     }
 
     /// Pins that `Debug` shows every `rdkafka` key and none of the values.
