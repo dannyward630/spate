@@ -258,6 +258,10 @@ pub(crate) struct Ledger {
     /// Per partition, one past the last offset read.
     next: Vec<Option<i64>>,
     counts: HashMap<Box<[u8]>, u32>,
+    /// How many waits on the ledger's condvar the gate has begun, counted
+    /// under the ledger's lock just before each.
+    #[cfg(test)]
+    pub(crate) gate_waits: usize,
 }
 
 /// The ledger and the condvar the follower notifies after each record.
@@ -274,6 +278,8 @@ impl Ledger {
         Ledger {
             next: vec![None; partitions.get() as usize],
             counts: HashMap::new(),
+            #[cfg(test)]
+            gate_waits: 0,
         }
     }
 
@@ -300,15 +306,20 @@ impl Ledger {
         self.counts.get(identity).copied().unwrap_or(0)
     }
 
+    /// One past the last offset of `partition` read, `None` before the
+    /// first.
+    pub(crate) fn read_to(&self, partition: i32) -> Option<i64> {
+        usize::try_from(partition)
+            .ok()
+            .and_then(|p| self.next.get(p).copied())
+            .flatten()
+    }
+
     /// Whether the ledger holds every record of `partition` below `hwm`,
     /// given the partition's watermarks `(lwm, hwm)`. Partition EOF carries
     /// no offset, so the offsets read are the only measure.
     pub(crate) fn caught_up(&self, partition: i32, lwm: i64, hwm: i64) -> bool {
-        let next = usize::try_from(partition)
-            .ok()
-            .and_then(|p| self.next.get(p).copied())
-            .flatten();
-        hwm <= lwm || next >= Some(hwm)
+        hwm <= lwm || self.read_to(partition) >= Some(hwm)
     }
 }
 
@@ -321,8 +332,8 @@ pub(crate) struct Follower {
 }
 
 impl Follower {
-    /// A follower of the `partitions` partitions of `topic`, assigned at
-    /// their start.
+    /// A follower of every partition of `core`'s attempt topic, assigned at
+    /// their start, reading into `core`'s ledger.
     ///
     /// # Errors
     ///
@@ -331,9 +342,9 @@ impl Follower {
     pub(crate) fn new(
         config: &KafkaFeedConfig,
         core: Arc<Core>,
-        topic: &str,
-        partitions: NonZeroU32,
     ) -> Result<Follower, KafkaFeedError> {
+        let topic = &*core.topics.attempt;
+        let partitions = core.attempt_partitions;
         let openssl_env = crate::security::openssl_env_overrides();
         let consumer = BaseConsumer::from_config_and_context(
             &config.follower_config(openssl_env),
@@ -354,13 +365,15 @@ impl Follower {
         consumer
             .assign(&tpl)
             .map_err(|e| KafkaFeedError::Refused(format!("assigning `{topic}`: {e}")))?;
+        let ledger = Arc::clone(&core.ledger);
         Ok(Follower {
             core,
             consumer,
-            ledger: Arc::new((Mutex::new(Ledger::new(partitions)), Condvar::new())),
+            ledger,
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn ledger(&self) -> SharedLedger {
         Arc::clone(&self.ledger)
     }
@@ -435,6 +448,7 @@ mod tests {
             work: Arc::from("units"),
             retry: Arc::from("units-retry"),
             dead_letter: Arc::from("units-dead"),
+            attempt: Arc::from("units-attempts"),
         }
     }
 
@@ -632,15 +646,16 @@ mod tests {
     fn config() -> KafkaFeedConfig {
         let section: spate_core::config::FeedSection = serde_yaml::from_str(
             "kafka:\n  brokers: 127.0.0.1:1\n  group_id: workers\n  topic: units\n  \
-             retry_topic: units-retry\n  dead_letter_topic: units-dead\n",
+             retry_topic: units-retry\n  dead_letter_topic: units-dead\n  \
+             attempt_topic: units-attempts\n",
         )
         .unwrap();
         KafkaFeedConfig::from_section(&section).unwrap()
     }
 
     fn follower(config: &KafkaFeedConfig) -> Result<Follower, KafkaFeedError> {
-        let core = Arc::new(Core::new(config));
-        Follower::new(config, core, "units-attempts", NonZeroU32::MIN)
+        let core = Arc::new(Core::new(config, NonZeroU32::MIN));
+        Follower::new(config, core)
     }
 
     /// Pins that a follower librdkafka will not build is refused, and that
@@ -753,7 +768,8 @@ mod tests {
                 .unwrap();
             let section: FeedSection = serde_yaml::from_str(&format!(
                 "kafka:\n  brokers: \"{brokers}\"\n  group_id: {}\n  topic: units\n  \
-                 retry_topic: units-retry\n  dead_letter_topic: units-dead\n",
+                 retry_topic: units-retry\n  dead_letter_topic: units-dead\n  \
+                 attempt_topic: {ATTEMPTS}\n",
                 spate_test::unique_name("follower")
             ))
             .unwrap();
@@ -804,9 +820,8 @@ mod tests {
 
         impl Running {
             fn start(rig: &Rig) -> (Running, SharedLedger) {
-                let core = Arc::new(Core::new(&rig.config));
-                let follower =
-                    Follower::new(&rig.config, Arc::clone(&core), ATTEMPTS, TWO).unwrap();
+                let core = Arc::new(Core::new(&rig.config, TWO));
+                let follower = Follower::new(&rig.config, Arc::clone(&core)).unwrap();
                 let ledger = follower.ledger();
                 let thread = Some(follower.spawn().unwrap());
                 (Running { core, thread }, ledger)
