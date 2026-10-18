@@ -17,7 +17,7 @@
 //! SIGKILL.
 //!
 //! The assertion is the one an operator cares about: SIGTERM with the sink
-//! down still exits, under its own deadline, having abandoned loudly.
+//! down still exits once its own deadline passes, having abandoned loudly.
 //!
 //! Selecting it:
 //!
@@ -32,7 +32,7 @@
 #[path = "e2e_support/mod.rs"]
 mod support;
 
-use spate_test::metric_sum;
+use spate_test::metric_series;
 use std::time::{Duration, Instant};
 use support::*;
 
@@ -40,9 +40,11 @@ use support::*;
 /// rather than hangs.
 const EXIT_BOUND: Duration = Duration::from_secs(60);
 
+/// Pins that a drain started while the sink answers nothing still exits once
+/// `drain_timeout` runs out and abandons what it could not write.
 #[test]
 #[ignore = "requires Docker"]
-fn shutdown_during_a_sink_outage_still_exits_under_its_deadline() {
+fn shutdown_during_a_sink_outage_still_exits_at_its_deadline() {
     let h = Harness::up();
     let mut params = PipelineParams::defaults("e2e-drain-outage", 19187);
     // One permit per shard, small batches and queues: the outage saturates the
@@ -72,15 +74,17 @@ fn shutdown_during_a_sink_outage_still_exits_under_its_deadline() {
     h.pause_clickhouse();
     h.produce(&params.topic, second_wave);
 
-    // Backpressure engaging is the precondition this scenario needs. The
-    // queues only fill once the worker has stopped consuming them, which is
-    // the state of having sealed a batch it cannot get a permit for.
+    // Over the cap means a sealed batch is queued behind a write the frozen
+    // sink never answers. The pause gauge also reads 1 under a healthy sink.
+    let cap = params.inflight_max_per_shard as f64;
     wait_until(
         Duration::from_secs(90),
-        "backpressure engaged (worker holds a batch it cannot dispatch)",
+        "a stall caused by the outage (worker holds a batch it cannot dispatch)",
         || {
             let (_, body) = http_get(pipeline.admin, "/metrics");
-            metric_sum(&body, "spate_backpressure_paused", &[]).unwrap_or(0.0) >= 1.0
+            metric_series(&body, "spate_sink_inflight_batches", &[])
+                .iter()
+                .any(|s| s.value > cap)
         },
     );
 
@@ -111,7 +115,7 @@ fn shutdown_during_a_sink_outage_still_exits_under_its_deadline() {
     );
     println!("drain-during-outage: exited in {exited_in:?}, report {report:?}");
 
-    // The exit sits inside the drain's own budget, not some looser bound.
+    // The drain deadline ends the run, so the exit lands just after it.
     assert!(
         exited_in < Duration::from_secs(30),
         "exit took {exited_in:?} against a 10s drain_timeout"
