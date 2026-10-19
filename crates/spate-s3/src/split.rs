@@ -99,8 +99,9 @@ pub struct DescriptorObject {
 /// The range owns the records whose first byte lies in `[start, end)`, where a
 /// record starts at byte 0 and after every `delimiter` byte, so each record of
 /// an object belongs to exactly one range of a tiling. The object must be
-/// uncompressed: a reader whose `compression` setting decodes the key fails
-/// the pipeline on a ranged split.
+/// uncompressed. When the reader's `compression` setting decodes the key, a
+/// coordinated reader fails the pipeline on the split and a feed reader fails
+/// the unit back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SplitRange {
@@ -535,7 +536,7 @@ impl Packed {
 
 /// Cut `[0, size)` into `ceil(size / target)` contiguous ranges, each
 /// between `target / 2` and `target` bytes long when `size > target`.
-fn tile(size: u64, target: u64, delimiter: u8) -> impl Iterator<Item = SplitRange> {
+pub(crate) fn tile(size: u64, target: u64, delimiter: u8) -> impl Iterator<Item = SplitRange> {
     let n = size.div_ceil(target);
     // u128: `i * size` reaches about 2^71 for the largest object at the 1 MiB
     // target floor.
