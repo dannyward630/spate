@@ -2,8 +2,9 @@
 //!
 //! Four tasks on the I/O runtime do the queue's I/O. The receive task long
 //! polls while the reader wants more units than are buffered. The renewal
-//! task extends, every third of the visibility period, each held unit handed
-//! out or renewed since the last extension. The settle task sends deletes and
+//! task extends, every third of the visibility period, each unit handed out
+//! or renewed since the last extension, and each unit still buffered when
+//! the reader has called the feed since then. The settle task sends deletes and
 //! fails, and the publish task sends publishes, each in batches of up to
 //! ten. The [`Feed`] methods only lock the shared state, change it and
 //! signal a task, so none of them waits (INV-2).
@@ -15,7 +16,8 @@
 //! receive's reply arrives, less 30 seconds, and clamps every deadline and
 //! extension to it. A unit whose deadline is less than one renewal period
 //! away when the reader asks for it is dropped unseen and returns to the
-//! queue at that deadline.
+//! queue at that deadline. A buffered unit whose extension SQS refused,
+//! because its receipt no longer holds the message, is dropped unseen too.
 
 use crate::client;
 use crate::config::{BACKEND, SqsFeedConfig};
@@ -186,6 +188,8 @@ struct State {
     abandoned: bool,
     /// Units the reader asked for and did not get at its last `receive`.
     demand: usize,
+    /// The reader called `receive` or `renew` since the last tick.
+    reader_active: bool,
     /// Received units not yet handed out, oldest first.
     buffered: VecDeque<u64>,
     held: HashMap<u64, Held>,
@@ -487,6 +491,7 @@ impl Feed for SqsFeed {
         let period = self.shared.settings.period;
         let (out, more, waker) = {
             let mut st = self.lock();
+            st.reader_active = true;
             if let Some(fatal) = &st.fatal {
                 return Err(fatal.clone());
             }
@@ -498,18 +503,19 @@ impl Feed for SqsFeed {
             }
             let now = Instant::now();
             // A unit this close to its deadline would lapse before the next
-            // renewal could keep it. A unit kept is marked when handed out, so
+            // renewal could keep it, and a gone one no longer holds its
+            // message. A unit kept is marked when handed out, so
             // a tick before the reader's first renew still extends it.
             let State { buffered, held, .. } = &mut *st;
             buffered.retain(|receipt| {
-                let keep = held
-                    .get(receipt)
-                    .is_some_and(|h| h.deadline.saturating_duration_since(now) >= period);
+                let keep = held.get(receipt).is_some_and(|h| {
+                    !h.gone && h.deadline.saturating_duration_since(now) >= period
+                });
                 if !keep {
                     held.remove(receipt);
                     tracing::debug!(
                         receipt,
-                        "dropping a received unit too close to its deadline"
+                        "dropping a received unit that is gone or too close to its deadline"
                     );
                 }
                 keep
@@ -544,6 +550,7 @@ impl Feed for SqsFeed {
 
     fn renew(&self, receipt: Receipt) -> Result<(), FeedError> {
         let mut st = self.lock();
+        st.reader_active = true;
         if let Some(fatal) = &st.fatal {
             return Err(fatal.clone());
         }
@@ -735,10 +742,13 @@ fn held_from(m: Received, sent_at: Instant, hold_end: Instant, visibility: Durat
     }
 }
 
-/// Every renewal period, extends each held unit marked since the last tick.
+/// Every renewal period, extends each held unit marked since the last tick,
+/// and each buffered unit when the reader was active since the last tick.
 async fn renewal_task(shared: Arc<Shared>) {
     let settings = shared.settings;
-    let mut tick = tokio::time::interval(settings.period);
+    // No tick at start: a unit received before the first one still has its
+    // whole visibility left, and extending it would only spend a call.
+    let mut tick = tokio::time::interval_at(Instant::now() + settings.period, settings.period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
@@ -748,9 +758,13 @@ async fn renewal_task(shared: Arc<Shared>) {
             if st.fatal.is_some() || st.abandoned {
                 return;
             }
+            // A buffered unit is extended only for a reader still polling, or
+            // to retry a failed extension, so a stalled worker loses it one
+            // visibility period after its last extension.
+            let active = std::mem::take(&mut st.reader_active);
             st.held
                 .iter_mut()
-                .filter(|(_, h)| h.marked && !h.gone && h.unit.is_none())
+                .filter(|(_, h)| !h.gone && (h.marked || (active && h.unit.is_some())))
                 .filter_map(|(&receipt, h)| {
                     h.marked = false;
                     if now >= h.deadline {

@@ -808,6 +808,8 @@ async fn the_first_deadline_counts_from_when_the_receive_was_sent() {
     feed.set_waker(waker);
     queue.answer_at_end_of_poll();
     queue.ready(Message::new("late"));
+    // The poll ends on the first tick, which would extend the buffered unit.
+    queue.fail_next_visibility_call(CallError::retryable("InternalError"));
     let sent = Instant::now();
     assert!(feed.receive(1).unwrap().is_empty());
     until("the poll is sent", || queue.receives().len() == 1).await;
@@ -1139,4 +1141,171 @@ async fn the_connect_bound_names_the_read_it_was_on() {
             other => panic!("expected unavailable, got {other:?}"),
         }
     }
+}
+
+/// Buffer `taken` and `waiting`, and hand out `taken` (handle `h0`), leaving
+/// `waiting` (handle `h1`) buffered.
+async fn one_taken_one_buffered(feed: &SqsFeed, queue: &ScriptedQueue) -> Delivery {
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    queue.ready(Message::new("taken"));
+    queue.ready(Message::new("waiting"));
+    assert!(feed.receive(2).unwrap().is_empty());
+    until("both units are buffered", || feed.buffered() == 2).await;
+    assert!(park.park(Duration::ZERO));
+    feed.receive(1).unwrap().remove(0)
+}
+
+fn extended_handles(calls: &[Vec<VisibilityEntry>]) -> Vec<String> {
+    calls.iter().flatten().map(|e| e.handle.clone()).collect()
+}
+
+/// Pins that a unit received for the reader but not yet handed out is
+/// extended on every tick while the reader is active, so it outlives its
+/// first visibility. Regression for #1276.
+#[tokio::test(start_paused = true)]
+async fn a_buffered_unit_is_extended_until_the_reader_takes_it() {
+    let (feed, queue) = start(MINUTE);
+    let taken = one_taken_one_buffered(&feed, &queue).await;
+    for _ in 0..4 {
+        feed.renew(taken.receipt).unwrap();
+        step(Duration::from_secs(20)).await;
+    }
+    let extended = extended_handles(&queue.visibility());
+    assert!(
+        extended.iter().any(|h| h == "h1"),
+        "the buffered unit was never extended: {extended:?}"
+    );
+    let got = feed.receive(1).unwrap();
+    assert_eq!(
+        got.len(),
+        1,
+        "the buffered unit lapsed before the reader took it"
+    );
+}
+
+/// Pins that a buffered unit is not extended once the reader stops calling
+/// the feed, so a stalled worker loses it one visibility period after its
+/// last extension.
+#[tokio::test(start_paused = true)]
+async fn a_buffered_unit_is_not_extended_once_the_reader_stops_calling() {
+    let (feed, queue) = start(MINUTE);
+    one_taken_one_buffered(&feed, &queue).await;
+    step(Duration::from_secs(20)).await;
+    until("the tick after the last call runs", || {
+        !queue.visibility().is_empty()
+    })
+    .await;
+    let quiet_from = queue.visibility().len();
+    step(Duration::from_secs(80)).await;
+    let later = extended_handles(&queue.visibility()[quiet_from..]);
+    assert!(
+        !later.iter().any(|h| h == "h1"),
+        "extended for a reader that stopped calling: {later:?}"
+    );
+    assert!(
+        feed.receive(1).unwrap().is_empty(),
+        "the buffered unit outlived its deadline"
+    );
+}
+
+/// Pins that a buffered unit whose extension SQS refuses as no longer held
+/// is not extended again and is dropped unread at the next receive.
+#[tokio::test(start_paused = true)]
+async fn a_buffered_unit_the_queue_refuses_to_extend_is_dropped_unread() {
+    let (feed, queue) = start(MINUTE);
+    let taken = one_taken_one_buffered(&feed, &queue).await;
+    feed.renew(taken.receipt).unwrap();
+    // Entries go out sorted by receipt, so the buffered unit is entry 1.
+    queue.fail_next_visibility(vec![failure(1, "ReceiptHandleIsInvalid")]);
+    step(Duration::from_secs(20)).await;
+    until("the tick extends the units", || {
+        queue.visibility().len() == 1
+    })
+    .await;
+    feed.renew(taken.receipt).unwrap();
+    step(Duration::from_secs(20)).await;
+    let later = extended_handles(&queue.visibility()[1..]);
+    assert!(
+        !later.iter().any(|h| h == "h1"),
+        "a refused unit was extended again: {later:?}"
+    );
+    assert_eq!(
+        feed.receive(1).unwrap().len(),
+        0,
+        "a gone unit was handed out"
+    );
+    assert_eq!(feed.buffered(), 0);
+}
+
+/// Pins that a reader calling only `receive`, with no unit to renew, keeps
+/// its buffered units extended.
+#[tokio::test(start_paused = true)]
+async fn a_reader_that_only_receives_keeps_its_buffered_units() {
+    let (feed, queue) = start(MINUTE);
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    for i in 0..4 {
+        queue.ready(Message::new(&format!("u{i}")));
+    }
+    assert!(feed.receive(4).unwrap().is_empty());
+    until("the units are buffered", || feed.buffered() == 4).await;
+    assert!(park.park(Duration::ZERO));
+    for at in [0, 30, 60] {
+        let got = feed.receive(1).unwrap();
+        assert_eq!(got.len(), 1, "nothing handed out at {at} s");
+        step(Duration::from_secs(30)).await;
+    }
+    assert_eq!(
+        feed.receive(1).unwrap().len(),
+        1,
+        "the last buffered unit lapsed"
+    );
+}
+
+/// Pins that a buffered unit whose extension call failed whole is extended
+/// at the next tick, after the reader stopped calling the feed.
+#[tokio::test(start_paused = true)]
+async fn a_failed_extension_of_a_buffered_unit_is_sent_again_at_the_next_tick() {
+    let (feed, queue) = start(MINUTE);
+    let taken = one_taken_one_buffered(&feed, &queue).await;
+    feed.renew(taken.receipt).unwrap();
+    queue.fail_next_visibility_call(CallError::retryable("InternalError"));
+    step(Duration::from_secs(20)).await;
+    until("the first extension is sent", || {
+        queue.visibility().len() == 1
+    })
+    .await;
+    step(Duration::from_secs(20)).await;
+    let retried = extended_handles(&queue.visibility()[1..]);
+    assert!(
+        retried.iter().any(|h| h == "h1"),
+        "the failed extension was not sent again: {retried:?}"
+    );
+}
+
+/// Pins that a `receive` answered with a transient receive failure counts as
+/// the reader polling, so its buffered unit is still extended.
+#[tokio::test(start_paused = true)]
+async fn a_receive_answered_with_a_receive_failure_keeps_buffered_units() {
+    let (feed, queue) = start(MINUTE); // ticks near 20, 40, 60, 80
+    let (waker, park) = wake_channel();
+    feed.set_waker(waker);
+    queue.ready(Message::new("u"));
+    assert!(feed.receive(2).unwrap().is_empty());
+    until("the unit is buffered", || feed.buffered() == 1).await;
+    assert!(park.park(Duration::ZERO));
+    for _ in 0..2 {
+        // The receive task's next poll fails, and the reader's next
+        // `receive` answers with it, handing out nothing.
+        queue.fail_next_receive(CallError::retryable("InternalError"));
+        step(Duration::from_secs(25)).await;
+        assert_eq!(feed.receive(1).unwrap_err().kind, FeedErrorKind::Retryable);
+    }
+    step(Duration::from_secs(35)).await; // t near 85 s
+    assert_eq!(
+        feed.receive(1).unwrap().len(),
+        1,
+        "the buffered unit lapsed while the reader polled"
+    );
 }
