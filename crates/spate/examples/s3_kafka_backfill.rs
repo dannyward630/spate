@@ -13,8 +13,9 @@
 //!
 //! A broker at `KAFKA_BROKERS`, `localhost:9092` by default. The feed never
 //! creates a topic, so `main()` creates the work, retry, dead-letter and
-//! attempt topics first when they are missing, the dead-letter topic keeping
-//! its messages for ever and the attempt topic compacted. Against a local
+//! attempt topics first when they are missing, the work topic stamped with
+//! `LogAppendTime`, the dead-letter topic keeping its messages for ever and
+//! the attempt topic compacted. Against a local
 //! broker:
 //!
 //! ```sh
@@ -102,7 +103,8 @@ fn create_topics(pipeline: &Pipeline, brokers: &str) -> Result<(), Box<dyn std::
         .set("bootstrap.servers", brokers)
         .create()?;
     let topics = [
-        NewTopic::new("s3-kafka-demo", 3, TopicReplication::Fixed(1)),
+        NewTopic::new("s3-kafka-demo", 3, TopicReplication::Fixed(1))
+            .set("message.timestamp.type", "LogAppendTime"),
         NewTopic::new("s3-kafka-demo-retry", 1, TopicReplication::Fixed(1)),
         NewTopic::new("s3-kafka-demo-dead", 1, TopicReplication::Fixed(1))
             .set("retention.ms", "-1"),
