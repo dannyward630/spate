@@ -938,6 +938,8 @@ mod tests {
         }
     }
 
+    /// The manifest selector covers each build input without absorbing nearby files.
+    /// Regression for #1240.
     #[test]
     fn the_manifest_selector_covers_its_build_and_gate_inputs() {
         for path in [
@@ -950,12 +952,22 @@ mod tests {
             "test-support/Cargo.toml",
             "xtask/Cargo.toml",
             "xtask/src/ci/classify.rs",
+            "xtask/src/release/mod.rs",
             ".github/workflows/ci.yml",
             ".github/toolchains/nightly/rust-toolchain.toml",
         ] {
             assert!(run(&[path]).manifests, "{path}");
         }
-        assert!(!run(&["docs/a.md"]).manifests);
+        for path in [
+            "bench/src/lib.rs",
+            "faults/src/lib.rs",
+            "test-support/src/lib.rs",
+            ".github/workflows/scheduled.yml",
+            "deny.toml",
+            "docs/a.md",
+        ] {
+            assert!(!run(&[path]).manifests, "{path}");
+        }
     }
 
     #[test]
