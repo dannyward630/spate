@@ -131,8 +131,8 @@ pub(super) fn is_rust_change(path: &str) -> bool {
 }
 
 /// Files that can change whether `cargo package` succeeds or whether the
-/// declared floors still resolve. The gate's own apparatus is included, so an
-/// edit narrowing the gate is itself gated.
+/// declared floors still resolve. Changes to the gate apparatus listed here
+/// select the gated jobs, and classifier tests pin those paths.
 pub(crate) fn is_manifest(path: &str) -> bool {
     any_glob(
         path,
@@ -938,10 +938,36 @@ mod tests {
         }
     }
 
+    /// The manifest selector covers each build input without absorbing nearby files.
+    /// Regression for #1240.
     #[test]
-    fn a_manifest_change_is_seen() {
-        assert!(run(&["crates/spate-s3/Cargo.toml"]).manifests);
-        assert!(!run(&["docs/a.md"]).manifests);
+    fn the_manifest_selector_covers_its_build_and_gate_inputs() {
+        for path in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "crates/spate-s3/Cargo.toml",
+            "bench/Cargo.toml",
+            "faults/Cargo.toml",
+            "fuzz/Cargo.toml",
+            "test-support/Cargo.toml",
+            "xtask/Cargo.toml",
+            "xtask/src/ci/classify.rs",
+            "xtask/src/release/mod.rs",
+            ".github/workflows/ci.yml",
+            ".github/toolchains/nightly/rust-toolchain.toml",
+        ] {
+            assert!(run(&[path]).manifests, "{path}");
+        }
+        for path in [
+            "bench/src/lib.rs",
+            "faults/src/lib.rs",
+            "test-support/src/lib.rs",
+            ".github/workflows/scheduled.yml",
+            "deny.toml",
+            "docs/a.md",
+        ] {
+            assert!(!run(&[path]).manifests, "{path}");
+        }
     }
 
     #[test]
