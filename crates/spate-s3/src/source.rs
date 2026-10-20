@@ -17,7 +17,9 @@
 //!
 //! A source given a feed, by the pipeline's `feed:` section or through the
 //! `testing`-gated `with_feed`, reads work units through
-//! `unit_reader::UnitReader` in place of all of the above.
+//! `unit_reader::UnitReader` in place of all of the above. When the section
+//! names a `location`, `open` first waits for the lister's job fingerprint
+//! there and refuses a mismatch.
 //!
 //! No coordination backend appears in this crate's public API or in its
 //! cargo features. The store comes from the `coordination:` section through
@@ -30,6 +32,7 @@
 use crate::config::{S3SourceConfig, s3_store_key};
 use crate::lane::S3Lane;
 use crate::listing::{UnaddressableConnector, UnaddressableKeys};
+use crate::location::{Location, SETTLING_WINDOW, await_fingerprint, feed_fingerprint};
 use crate::metrics::S3Metrics;
 use crate::planner::{S3Planner, job_fingerprint};
 use crate::split::Packing;
@@ -40,6 +43,7 @@ use object_store::aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::{ClientConfigKey, ObjectStore, ObjectStoreScheme};
 use spate_coordination::store::memory::MemoryStore;
 use spate_coordination::{CoordinationConfig, CoordinatorSpec, StoreCoordinator};
+use spate_core::clock::tokio::{Clock, SystemClock};
 use spate_core::config::{ComponentConfig, ConfigError, CoordinationSection, FeedSection};
 use spate_core::coordination::driver::CoordinationDriver;
 use spate_core::coordination::{PlanFinality, SplitCoordinator};
@@ -97,6 +101,13 @@ pub struct S3Source {
     feed: Option<Arc<dyn Feed>>,
     /// The `feed:` section's `units_held`.
     units_held: Option<NonZeroUsize>,
+    /// The `feed:` section's `location`, for a bounded job.
+    location: Option<Location>,
+    /// A location store injected via the `testing`-gated
+    /// `with_location_store` seam.
+    location_store: Option<Arc<dyn ObjectStore>>,
+    /// Times the wait for the job fingerprint.
+    clock: Arc<dyn Clock>,
     state: State,
 }
 
@@ -129,6 +140,9 @@ impl S3Source {
             store: None,
             feed: None,
             units_held: None,
+            location: None,
+            location_store: None,
+            clock: Arc::new(SystemClock),
             state: State::Created,
         }
     }
@@ -207,8 +221,9 @@ impl S3Source {
     /// the feed. A whole object that qualifies for byte ranges under
     /// `split_target_bytes` is read in ranges. Conflicts with
     /// [`with_coordinator`](S3Source::with_coordinator), with a
-    /// `coordination:` section and with a `feed:` section, and never reports
-    /// the input drained, so the run ends at a shutdown.
+    /// `coordination:` section and with a `feed:` section, reads no job
+    /// location, and never reports the input drained, so the run ends at a
+    /// shutdown.
     ///
     /// Behind the off-by-default `testing` feature, outside the semver
     /// surface.
@@ -220,6 +235,224 @@ impl S3Source {
     pub fn with_feed(mut self, feed: Arc<dyn Feed>) -> S3Source {
         self.feed = Some(feed);
         self
+    }
+
+    /// Test seam: replace the store built from the `feed:` section's
+    /// `location` (the location still names the prefix within it).
+    ///
+    /// Behind the off-by-default `testing` feature, outside the semver
+    /// surface.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_location_store(mut self, store: Arc<dyn ObjectStore>) -> S3Source {
+        self.location_store = Some(store);
+        self
+    }
+
+    /// Test seam: time the wait for the job fingerprint on `clock`.
+    ///
+    /// Behind the off-by-default `testing` feature, outside the semver
+    /// surface.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> S3Source {
+        self.clock = clock;
+        self
+    }
+
+    /// Test seam: list the prefix once and publish one unit per object or
+    /// byte range to `feed`, blocking the calling thread on the I/O handle.
+    ///
+    /// With a `location` in `section` it first creates the job fingerprint
+    /// there, or compares the one already there, and deletes an earlier end
+    /// marker. It writes no end marker. The lister run's entry point
+    /// replaces it.
+    ///
+    /// Behind the off-by-default `testing` feature, outside the semver
+    /// surface.
+    ///
+    /// # Errors
+    ///
+    /// Fatal for a durable feed with no `location`, a source with no framer,
+    /// another fingerprint at the location, and a store that cannot create
+    /// an object conditionally. A publish the feed refuses keeps the class
+    /// the feed gave it.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub fn list_once(
+        mut self,
+        section: &FeedSection,
+        feed: Arc<dyn Feed>,
+    ) -> Result<(), SourceError> {
+        let fatal = |reason: String| SourceError::Client {
+            class: ErrorClass::Fatal,
+            reason,
+        };
+        let location = section
+            .location
+            .as_deref()
+            .map(|location| self.parse_location(location))
+            .transpose()
+            .map_err(|e| fatal(e.to_string()))?;
+        if location.is_none() && section.backend().type_tag() != "memory" {
+            return Err(fatal(format!(
+                "a lister on the `{}` feed runs a bounded job, which keeps its fingerprint at \
+                 a job location; set `feed.location`",
+                section.backend().type_tag()
+            )));
+        }
+        let make_framer = self.framer.clone().ok_or_else(|| {
+            fatal("S3Source has no record framer; supply one with `with_framer(...)`".into())
+        })?;
+        self.config.validate().map_err(|e| fatal(e.to_string()))?;
+        let (store, prefix, _, _) = self.data_store()?;
+        let delimiter = make_framer().resync_delimiter();
+        let location = match location {
+            Some(location) => Some((self.location_store(&location)?, location)),
+            None => None,
+        };
+        let lister = crate::lister::Lister {
+            store,
+            prefix,
+            packing: Packing {
+                target_bytes: self.config.split_target_bytes.as_u64(),
+                compression: self.config.compression,
+                delimiter,
+            },
+            feed,
+            location,
+            fingerprint: feed_fingerprint(
+                &self.config.url,
+                self.config.compression,
+                self.config.split_target_bytes.as_u64(),
+                delimiter,
+            ),
+        };
+        self.handle.block_on(lister.run())
+    }
+}
+
+impl S3Source {
+    /// The store the source reads: the injected one, or one built from
+    /// `config.url`. Returns it with the listing prefix, the unaddressable
+    /// keys its client takes out of listings, and the bucket a
+    /// notification's records must name.
+    fn data_store(&mut self) -> Result<DataStore, SourceError> {
+        let url = parse(&self.config.url)?;
+        Ok(match self.store.take() {
+            // Injected store: the URL still names the listing prefix, and the
+            // bucket for notifications is its host under `s3` or `s3a`.
+            Some(store) => {
+                let (_, path) =
+                    ObjectStoreScheme::parse(&url).map_err(|e| SourceError::Client {
+                        class: ErrorClass::Fatal,
+                        reason: format!("parsing {}: {e}", self.config.url),
+                    })?;
+                let bucket = matches!(url.scheme(), "s3" | "s3a")
+                    .then(|| url.host_str().map(str::to_owned))
+                    .flatten();
+                (store, path, None, bucket)
+            }
+            None => {
+                let built =
+                    build_store(&url, &self.config.store).map_err(|e| SourceError::Client {
+                        class: ErrorClass::Fatal,
+                        reason: format!("building the object store for {}: {e}", self.config.url),
+                    })?;
+                (
+                    Arc::from(built.store),
+                    built.prefix,
+                    built.unaddressable,
+                    built.bucket,
+                )
+            }
+        })
+    }
+
+    /// Parse the `feed:` section's `location` against this source's `url`
+    /// and `store` options, which also build the location's store.
+    ///
+    /// Beyond [`Location::parse`], an S3 location is refused when a `store`
+    /// key is not an S3 option, since load checks the keys against the
+    /// source URL's scheme only, and when the options or the environment ask
+    /// for virtual-hosted requests on a set endpoint, which then addresses
+    /// the source's bucket whatever the location names.
+    fn parse_location(&self, location: &str) -> Result<Location, ConfigError> {
+        let parsed = Location::parse(location, &self.config.url)?;
+        if !matches!(
+            ObjectStoreScheme::parse(parsed.url()),
+            Ok((ObjectStoreScheme::AmazonS3, _))
+        ) {
+            return Ok(parsed);
+        }
+        let refuse = |why: String| ConfigError::Component {
+            context: "feed".into(),
+            message: format!("`location` {}: {why}", parsed.shown()),
+        };
+        if let Some(key) = self.config.store.keys().find(|k| s3_store_key(k).is_none()) {
+            return Err(refuse(format!(
+                "source.s3.store.\"{key}\" is not an object_store S3 option, and the \
+                 location's store is built from it"
+            )));
+        }
+        let options = apply_options(AmazonS3Builder::from_env(), &self.config.store);
+        // `object_store` reads the flag with these spellings, in any case.
+        let virtual_hosted = options
+            .get_config_value(&AmazonS3ConfigKey::VirtualHostedStyleRequest)
+            .is_some_and(|v| {
+                matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes" | "y"
+                )
+            });
+        let endpoint = [AmazonS3ConfigKey::Endpoint, AmazonS3ConfigKey::S3Endpoint]
+            .iter()
+            .any(|key| options.get_config_value(key).is_some());
+        // An `https://` source URL names its store by host, and an `s3://`
+        // location's store reaches that host only through a set endpoint;
+        // with none it goes to AWS, signed with the source's credentials.
+        let source_by_host = Url::parse(&self.config.url).is_ok_and(|u| {
+            matches!(u.scheme(), "https" | "http")
+                && !u
+                    .host_str()
+                    .is_some_and(|h| h == "amazonaws.com" || h.ends_with(".amazonaws.com"))
+        });
+        if source_by_host && !endpoint {
+            return Err(refuse(
+                "the source's `url` names a store other than AWS by its host, which an `s3://` \
+                 location does not carry; set that store's endpoint under the source's `store`"
+                    .into(),
+            ));
+        }
+        if virtual_hosted && endpoint {
+            return Err(refuse(
+                "the source's `store` or the environment sends virtual-hosted requests to a \
+                 set endpoint, which names one bucket whatever the location names; remove \
+                 `location`, or `virtual_hosted_style_request` from `store` and \
+                 `AWS_VIRTUAL_HOSTED_STYLE_REQUEST` from the environment"
+                    .into(),
+            ));
+        }
+        Ok(parsed)
+    }
+
+    /// The store holding `location`: the injected one, or one built from its
+    /// URL with the source's `store` options and the environment.
+    fn location_store(&self, location: &Location) -> Result<Arc<dyn ObjectStore>, SourceError> {
+        if let Some(store) = &self.location_store {
+            return Ok(Arc::clone(store));
+        }
+        build_store(location.url(), &self.config.store)
+            .map(|built| Arc::from(built.store))
+            .map_err(|e| SourceError::Client {
+                class: ErrorClass::Fatal,
+                reason: format!(
+                    "building the object store for the job location {}: {e}",
+                    location.shown()
+                ),
+            })
     }
 }
 
@@ -278,6 +511,11 @@ impl Source for S3Source {
                     .into(),
             });
         }
+        self.location = section
+            .location
+            .as_deref()
+            .map(|location| self.parse_location(location))
+            .transpose()?;
         self.feed = Some(feed);
         self.units_held = section.units_held;
         Ok(())
@@ -304,35 +542,7 @@ impl Source for S3Source {
             reason: e.to_string(),
         })?;
 
-        let url = parse(&self.config.url)?;
-        let (store, prefix, unaddressable, bucket) = match self.store.take() {
-            // Injected store: the URL still names the listing prefix, and the
-            // bucket for notifications is its host under `s3` or `s3a`.
-            Some(store) => {
-                let (_, path) =
-                    ObjectStoreScheme::parse(&url).map_err(|e| SourceError::Client {
-                        class: ErrorClass::Fatal,
-                        reason: format!("parsing {}: {e}", self.config.url),
-                    })?;
-                let bucket = matches!(url.scheme(), "s3" | "s3a")
-                    .then(|| url.host_str().map(str::to_owned))
-                    .flatten();
-                (store, path, None, bucket)
-            }
-            None => {
-                let built =
-                    build_store(&url, &self.config.store).map_err(|e| SourceError::Client {
-                        class: ErrorClass::Fatal,
-                        reason: format!("building the object store for {}: {e}", self.config.url),
-                    })?;
-                (
-                    Arc::from(built.store),
-                    built.prefix,
-                    built.unaddressable,
-                    built.bucket,
-                )
-            }
-        };
+        let (store, prefix, unaddressable, bucket) = self.data_store()?;
 
         let metrics = ctx.meter.as_ref().map(S3Metrics::new);
         if let Some(feed) = self.feed.take() {
@@ -351,6 +561,28 @@ impl Source for S3Source {
                      split_target_bytes are read whole and units naming a byte range are \
                      failed back to the feed"
                 );
+            }
+            if let Some(location) = &self.location {
+                let location_store = self.location_store(location)?;
+                let mine = feed_fingerprint(
+                    &self.config.url,
+                    self.config.compression,
+                    self.config.split_target_bytes.as_u64(),
+                    delimiter,
+                );
+                tracing::info!(
+                    location = %location.shown(),
+                    window = ?SETTLING_WINDOW,
+                    "waiting for the job fingerprint at the job location"
+                );
+                self.handle.block_on(await_fingerprint(
+                    location_store.as_ref(),
+                    location,
+                    &mine,
+                    self.clock.as_ref(),
+                    &ctx.stop,
+                    SETTLING_WINDOW,
+                ))?;
             }
             let parts = LaneParts {
                 store,
@@ -647,7 +879,7 @@ fn build_store(
 /// refuses a missing bucket and builds an empty one from an `https://` URL
 /// with no bucket in it; an empty bucket is `None`, so every created record
 /// fails its message.
-fn scope_bucket(store: &AmazonS3) -> Option<String> {
+pub(crate) fn scope_bucket(store: &AmazonS3) -> Option<String> {
     store
         .to_string()
         .strip_prefix("AmazonS3(")
@@ -655,6 +887,16 @@ fn scope_bucket(store: &AmazonS3) -> Option<String> {
         .filter(|bucket| !bucket.is_empty())
         .map(str::to_owned)
 }
+
+/// The store the source reads, its listing prefix, the unaddressable keys
+/// its client takes out of listings, and the bucket a notification's records
+/// must name.
+type DataStore = (
+    Arc<dyn ObjectStore>,
+    object_store::path::Path,
+    Option<UnaddressableKeys>,
+    Option<String>,
+);
 
 /// What [`build_store`] returns.
 struct BuiltStore {
@@ -855,5 +1097,146 @@ mod tests {
         let (_, want) =
             object_store::parse_url_opts(&url, std::iter::empty::<(String, String)>()).unwrap();
         assert_eq!(got, want, "file:// delegates to parse_url_opts unchanged");
+    }
+
+    fn source_with_store(store: &str) -> (S3Source, tokio::runtime::Runtime) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let body = format!("url: \"file:///tmp/spate-location/data/\"\nstore:\n{store}");
+        let source = S3Source::from_component_config(
+            &spate_test::component_config("s3", &body),
+            rt.handle().clone(),
+        )
+        .unwrap();
+        (source, rt)
+    }
+
+    /// Pins that the location's store is built with the source's `store`
+    /// options: an `s3://` location reaches the endpoint they name, which
+    /// answers 403.
+    #[test]
+    fn the_location_store_uses_the_source_store_options() {
+        let endpoint = crate::test_servers::status_server("403 Forbidden");
+        let (source, rt) = source_with_store(&format!(
+            "  endpoint: \"{endpoint}\"\n  allow_http: \"true\"\n  access_key_id: \"AKIDTEST\"\n  \
+             secret_access_key: \"test\"\n  region: \"us-east-1\"\n"
+        ));
+        let location = source.parse_location("s3://ops/jobs/a/").unwrap();
+        let store = source.location_store(&location).unwrap();
+        let err = rt
+            .block_on(crate::location::read_object(
+                store.as_ref(),
+                &location,
+                &location.fingerprint(),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("403") && err.contains("s3:ListBucket"),
+            "{err}"
+        );
+    }
+
+    /// Pins that an S3 location is refused when the source's `store` sends
+    /// virtual-hosted requests to a set endpoint, which names one bucket,
+    /// under every spelling and endpoint key `object_store` reads, and is kept
+    /// with an endpoint alone or virtual-hosted requests alone.
+    #[test]
+    fn a_location_beside_a_virtual_hosted_endpoint_is_refused() {
+        let (source, _rt) = source_with_store(
+            "  endpoint: \"https://b.store.example\"\n  virtual_hosted_style_request: \"true\"\n",
+        );
+        let err = source
+            .parse_location("s3://elsewhere/jobs/a/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("virtual_hosted_style_request"), "{err}");
+        for store in [
+            "  endpoint: \"https://b.store.example\"\n  virtual_hosted_style_request: \"True\"\n",
+            "  endpoint: \"https://b.store.example\"\n  virtual_hosted_style_request: \"1\"\n",
+            "  aws_endpoint_url_s3: \"https://b.store.example\"\n  virtual_hosted_style_request: \"yes\"\n",
+            "  endpoint: \"https://b.store.example\"\n  virtual_hosted_style_request: \"on\"\n",
+            "  endpoint: \"https://b.store.example\"\n  virtual_hosted_style_request: \"Y\"\n",
+        ] {
+            let (source, _rt) = source_with_store(store);
+            let err = source
+                .parse_location("s3://elsewhere/jobs/a/")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("virtual_hosted_style_request"),
+                "{store}: {err}"
+            );
+            assert!(
+                err.contains("AWS_VIRTUAL_HOSTED_STYLE_REQUEST"),
+                "{store}: {err}"
+            );
+        }
+        for store in [
+            "  endpoint: \"https://store.example\"\n",
+            "  virtual_hosted_style_request: \"true\"\n",
+            "  endpoint: \"https://store.example\"\n  virtual_hosted_style_request: \"false\"\n",
+        ] {
+            let (source, _rt) = source_with_store(store);
+            source.parse_location("s3://elsewhere/jobs/a/").unwrap();
+        }
+    }
+
+    /// Pins that an S3 location beside a source named by a non-AWS host is
+    /// refused unless `store` sets that store's endpoint, so its requests
+    /// never go to AWS signed with the source's credentials.
+    #[test]
+    fn a_location_beside_a_source_named_by_another_host_needs_an_endpoint() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let source = |store: &str| {
+            let body =
+                format!("url: \"https://0123abcd.r2.cloudflarestorage.com/data/events/\"\n{store}");
+            S3Source::from_component_config(
+                &spate_test::component_config("s3", &body),
+                rt.handle().clone(),
+            )
+            .unwrap()
+        };
+        let err = source("")
+            .parse_location("s3://ops/jobs/a/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("endpoint"), "{err}");
+        source("store:\n  endpoint: \"https://0123abcd.r2.cloudflarestorage.com\"\n")
+            .parse_location("s3://ops/jobs/a/")
+            .unwrap();
+        let aws = S3Source::from_component_config(
+            &spate_test::component_config(
+                "s3",
+                "url: \"https://data.s3.eu-west-2.amazonaws.com/events/\"\n",
+            ),
+            rt.handle().clone(),
+        )
+        .unwrap();
+        aws.parse_location("s3://ops/jobs/a/").unwrap();
+    }
+
+    /// Pins that an S3 location is refused when a `store` key is not an S3
+    /// option, which load checks only against an S3 source URL.
+    #[test]
+    fn an_s3_location_refuses_a_store_key_the_s3_client_does_not_know() {
+        let (source, _rt) = source_with_store("  endpont: \"http://127.0.0.1:9000\"\n");
+        let err = source
+            .parse_location("s3://ops/jobs/a/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"endpont\""), "{err}");
+        let (source, _rt) = source_with_store("  endpont: \"http://127.0.0.1:9000\"\n");
+        let dir = tempfile::tempdir().unwrap();
+        source
+            .parse_location(&format!("file://{}/jobs/a/", dir.path().display()))
+            .unwrap();
     }
 }
