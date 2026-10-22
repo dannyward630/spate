@@ -17,8 +17,9 @@ use spate_test::{WriteOutcome, wait_until};
 use std::time::{Duration, Instant};
 use support::feed::{
     ATTEMPT, ATTEMPT_PARTITIONS, COMMIT_PERIOD, DEAD, DEADLINE, ON_MOCK, RETRY, WORK, committed,
-    data_dir, direct, exists, feed_yaml, high_watermark, launch, produce_raw, publish,
-    read_attempts, read_topic, recs, sorted, stage, written,
+    data_dir, direct, exists, feed_yaml, high_watermark, high_watermarks, launch, produce_raw,
+    publish, publish_to, publisher_on_mock, read_attempts, read_topic, recs, sorted, stage,
+    written,
 };
 use support::{corrupt_batch, produce_batch};
 
@@ -768,4 +769,133 @@ fn an_overlong_topic_name_is_refused() {
         ),
         other => panic!("expected a refusal, got {other:?}"),
     }
+}
+
+/// Pins the publisher end to end: a publish is confirmed and writes the
+/// unit to the work topic, key the unit's id, value its body and no header,
+/// and writes nothing to the retry or dead-letter topics.
+#[test]
+fn a_publisher_writes_the_unit_to_the_work_topic() {
+    let cluster = cluster(1);
+    let brokers = cluster.bootstrap_servers();
+    let (publisher, _io) = publisher_on_mock(&feed_yaml(
+        &brokers,
+        &spate_test::unique_name("publisher"),
+        "",
+        "",
+    ));
+    let publisher = publisher.unwrap();
+    let unit = Unit::new("u", b"body".to_vec());
+    publish_to(&publisher, unit.clone());
+    let read = read_topic(&brokers, WORK, 1);
+    assert_eq!(read[0].key.as_deref(), Some(unit.id.as_bytes()));
+    assert_eq!(read[0].payload.as_deref(), Some(&unit.body[..]));
+    assert!(read[0].headers.is_empty(), "{:?}", read[0].headers);
+    assert_eq!(high_watermark(&brokers, RETRY), 0);
+    assert_eq!(high_watermark(&brokers, DEAD), 0);
+}
+
+/// Pins that a publish-only handle on the workers' group charges no unit an
+/// attempt: a worker on that group reads each published unit on its first
+/// delivery, and the attempt topic holds one count and one tombstone per
+/// unit, the worker's.
+#[test]
+fn a_publish_only_handle_charges_no_attempt() {
+    let cluster = cluster(1);
+    let brokers = cluster.bootstrap_servers();
+    let group = spate_test::unique_name("publish-only");
+    let yaml = feed_yaml(&brokers, &group, "", "");
+    let (publisher, _io) = publisher_on_mock(&yaml);
+    let publisher = publisher.unwrap();
+    for i in 0..3 {
+        publish_to(&publisher, Unit::new(format!("u{i}"), b"body".to_vec()));
+    }
+    let worker = direct(&yaml);
+    for _ in 0..3 {
+        let delivery = worker.take("a published unit");
+        assert_eq!(delivery.deliveries, 1, "{}", delivery.unit.id);
+        worker.feed.acknowledge(delivery.receipt).unwrap();
+    }
+    wait_until(DEADLINE, "every unit is committed", || {
+        committed(&brokers, &group, WORK) == Some(3)
+    });
+    wait_until(DEADLINE, "a count and a tombstone per unit", || {
+        high_watermarks(&brokers, ATTEMPT, ATTEMPT_PARTITIONS) == 6
+    });
+    drop(publisher);
+}
+
+/// Pins that the publisher runs the workers' startup check and refuses a
+/// missing retry topic, naming it.
+#[test]
+fn a_publisher_refuses_a_missing_retry_topic() {
+    let cluster = MockCluster::new(1).expect("mock cluster");
+    cluster.create_topic(WORK, 1, 1).unwrap();
+    cluster.create_topic(DEAD, 1, 1).unwrap();
+    let (publisher, _io) = publisher_on_mock(&feed_yaml(
+        &cluster.bootstrap_servers(),
+        &spate_test::unique_name("publisher-missing"),
+        "",
+        "",
+    ));
+    match publisher {
+        Err(KafkaFeedError::Refused(message)) => assert!(
+            message.contains(&format!("the retry topic `{RETRY}` does not exist")),
+            "{message}"
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// Pins that the publisher refuses a work topic the cluster reports
+/// unauthorized, naming the read.
+#[test]
+fn a_publisher_refuses_an_unauthorized_work_topic() {
+    let cluster = cluster(1);
+    cluster
+        .topic_error(
+            WORK,
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
+        )
+        .unwrap();
+    let (publisher, _io) = publisher_on_mock(&feed_yaml(
+        &cluster.bootstrap_servers(),
+        &spate_test::unique_name("publisher-unauthorized"),
+        "",
+        "",
+    ));
+    match publisher {
+        Err(KafkaFeedError::Refused(message)) => assert!(
+            message.contains(&format!("reading the metadata of the work topic `{WORK}`")),
+            "{message}"
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// Pins that the publish in flight when the cluster refuses the
+/// publisher's idempotent producer id fails with the refusal's cause.
+#[test]
+fn the_publish_in_flight_at_a_fatal_producer_error_names_its_cause() {
+    let cluster = cluster(1);
+    cluster.request_errors(
+        rdkafka::types::RDKafkaApiKey::InitProducerId,
+        &[RDKafkaRespErr::RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED],
+    );
+    let (publisher, io) = publisher_on_mock(&feed_yaml(
+        &cluster.bootstrap_servers(),
+        &spate_test::unique_name("publisher-in-flight-fatal"),
+        "",
+        "",
+    ));
+    let publisher = publisher.unwrap();
+    let err = io
+        .block_on(publisher.publish(Unit::new("a", b"body".to_vec())))
+        .unwrap_err();
+    assert_eq!(err.kind, FeedErrorKind::Fatal, "{}", err.reason);
+    assert!(
+        err.reason.contains("Cluster authorization failed"),
+        "{}",
+        err.reason
+    );
 }
