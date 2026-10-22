@@ -651,6 +651,7 @@ impl Pipeline {
                     replicas,
                     e2e_basis,
                 )
+                .map(|m| m.with_queue(queues.metrics(), shard))
                 .map_err(|e| BuildError::DuplicateSeries(e.to_string()))
             })
             .collect::<Result<_, _>>()?;
