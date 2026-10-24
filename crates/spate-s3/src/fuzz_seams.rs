@@ -239,3 +239,10 @@ pub fn notification_body(
     serde_json::to_vec(&serde_json::json!({ "Records": [record] }))
         .expect("a JSON value always serialises")
 }
+
+/// Whether the source can read `key` under its own name through
+/// `object_store`.
+#[must_use]
+pub fn addressable(key: &str) -> bool {
+    crate::listing::addressable(key)
+}
