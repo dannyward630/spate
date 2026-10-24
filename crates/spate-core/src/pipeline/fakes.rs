@@ -53,6 +53,21 @@ pub(crate) struct SourceLog {
     pub(crate) accept_feed: bool,
     /// The origin `configure_feed` was handed.
     pub(crate) feed_origin: Option<crate::feed::FeedOrigin>,
+    /// The answer to `reading_on_stop`, modeling a feed reader that still
+    /// holds units it is reading.
+    pub(crate) read_on_stop: bool,
+    /// How many times the controller asked `reading_on_stop`.
+    pub(crate) reading_on_stop_calls: usize,
+    /// How many times the controller called `stop_reading`.
+    pub(crate) stop_reading_calls: usize,
+    /// When set, a dropped lane logs `lane-dropped`, which a stop's drain
+    /// does once the drivers have their `Shutdown`.
+    pub(crate) log_lane_drops: bool,
+    /// When set, `open` fails fatally.
+    pub(crate) fail_open: bool,
+    /// Moved forward by this much in `open`, modeling a source that takes
+    /// that long to open.
+    pub(crate) advance_in_open: Option<(Arc<crate::clock::TestClock>, Duration)>,
 }
 
 pub(crate) enum Script {
@@ -118,8 +133,17 @@ impl Source for FakeSource {
     fn open(&mut self, ctx: SourceCtx) -> Result<(), SourceError> {
         {
             let mut log = self.shared.lock().unwrap();
+            if log.fail_open {
+                return Err(SourceError::Client {
+                    class: ErrorClass::Fatal,
+                    reason: "scripted open failure".into(),
+                });
+            }
             log.opened = true;
             log.stage_metrics_attached = ctx.stage_metrics.is_some();
+            if let Some((clock, by)) = &log.advance_in_open {
+                clock.advance(*by);
+            }
         }
         // Publish a lag figure like a real source would, so a test can tell
         // whether the handle set it was given owns the series. Only the owner
@@ -146,6 +170,7 @@ impl Source for FakeSource {
                         batches: s.batches.into(),
                         current: Vec::new(),
                         issuer: issuer.clone(),
+                        log: Arc::clone(&self.shared),
                     })
                     .collect();
                 Ok(SourceEvent::LanesAssigned(lanes))
@@ -160,6 +185,7 @@ impl Source for FakeSource {
                         batches: s.batches.into(),
                         current: Vec::new(),
                         issuer: issuer.clone(),
+                        log: Arc::clone(&self.shared),
                     })
                     .collect();
                 Ok(SourceEvent::LanesAdded(lanes))
@@ -262,6 +288,19 @@ impl Source for FakeSource {
         Ok(())
     }
 
+    fn reading_on_stop(&mut self) -> bool {
+        let mut log = self.shared.lock().unwrap();
+        log.reading_on_stop_calls += 1;
+        log.read_on_stop
+    }
+
+    fn stop_reading(&mut self) -> Result<(), SourceError> {
+        let mut log = self.shared.lock().unwrap();
+        log.stop_reading_calls += 1;
+        log.log.push("stop_reading".into());
+        Ok(())
+    }
+
     fn configure_feed(
         &mut self,
         section: &crate::config::FeedSection,
@@ -289,6 +328,18 @@ pub(crate) struct FakeLane {
     batches: VecDeque<Vec<(i64, Vec<u8>)>>,
     current: Vec<(i64, Vec<u8>)>,
     issuer: AckIssuer,
+    log: SharedLog,
+}
+
+impl Drop for FakeLane {
+    fn drop(&mut self) {
+        // A lane can drop while a panicking driver holds the lock poisoned.
+        if let Ok(mut log) = self.log.lock()
+            && log.log_lane_drops
+        {
+            log.log.push("lane-dropped".into());
+        }
+    }
 }
 
 impl SourceLane for FakeLane {
@@ -352,6 +403,103 @@ impl<'a> PayloadBatch<'a> for FakeBatch<'a> {
     }
 }
 
+/// A feed that hands back, over an in-process feed, under the backend key a
+/// test names. It records each `close` and its bound, and settles the close
+/// at once unless told to hold it.
+pub(crate) struct HandingBack {
+    inner: crate::feed::memory::MemoryFeed,
+    backend: &'static str,
+    hold_close: bool,
+    log: Option<SharedLog>,
+    pub(crate) closes: Mutex<Vec<Duration>>,
+    // A held close's confirmer, kept so the close never settles.
+    held: Mutex<Vec<crate::feed::Confirmer>>,
+}
+
+impl HandingBack {
+    pub(crate) fn new(backend: &'static str) -> HandingBack {
+        HandingBack {
+            inner: crate::feed::memory::MemoryFeed::new(),
+            backend,
+            hold_close: false,
+            log: None,
+            closes: Mutex::new(Vec::new()),
+            held: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Never settle a close.
+    pub(crate) fn holding_its_close(mut self) -> HandingBack {
+        self.hold_close = true;
+        self
+    }
+
+    /// Settle every close held so far.
+    pub(crate) fn settle_held_closes(&self) {
+        for confirmer in self.held.lock().unwrap().drain(..) {
+            confirmer.confirm();
+        }
+    }
+
+    /// Log `close` into `log` beside the source's entries.
+    pub(crate) fn logging_into(mut self, log: SharedLog) -> HandingBack {
+        self.log = Some(log);
+        self
+    }
+}
+
+impl crate::feed::Feed for HandingBack {
+    fn backend(&self) -> &str {
+        self.backend
+    }
+
+    fn set_waker(&self, waker: crate::feed::FeedWaker) {
+        self.inner.set_waker(waker);
+    }
+
+    fn receive(&self, max: usize) -> Result<Vec<crate::feed::Delivery>, crate::feed::FeedError> {
+        self.inner.receive(max)
+    }
+
+    fn renew(&self, receipt: crate::feed::Receipt) -> Result<(), crate::feed::FeedError> {
+        self.inner.renew(receipt)
+    }
+
+    fn acknowledge(&self, receipt: crate::feed::Receipt) -> Result<(), crate::feed::FeedError> {
+        self.inner.acknowledge(receipt)
+    }
+
+    fn fail(
+        &self,
+        receipt: crate::feed::Receipt,
+        reason: &str,
+    ) -> Result<(), crate::feed::FeedError> {
+        self.inner.fail(receipt, reason)
+    }
+
+    fn publish(&self, unit: crate::feed::Unit) -> crate::feed::Confirmation {
+        self.inner.publish(unit)
+    }
+
+    fn hands_back(&self) -> bool {
+        true
+    }
+
+    fn close(&self, within: Duration) -> Option<crate::feed::Confirmation> {
+        self.closes.lock().unwrap().push(within);
+        if let Some(log) = &self.log {
+            log.lock().unwrap().log.push("close".into());
+        }
+        let (confirmer, confirmation) = crate::feed::confirmation();
+        if self.hold_close {
+            self.held.lock().unwrap().push(confirmer);
+        } else {
+            confirmer.confirm();
+        }
+        Some(confirmation)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ChainShared {
     pub(crate) consumed: AtomicUsize,
@@ -362,6 +510,8 @@ pub(crate) enum ChainMode {
     Ok,
     BlockOnce(AtomicBool),
     BlockForever,
+    /// Block every batch until the flag is set, then take it.
+    BlockUntil(Arc<AtomicBool>),
     FatalAtBatch(usize),
     PanicAtBatch(usize),
     /// Fail the ack of the n-th batch (1-based) after consuming it, stalling
@@ -403,6 +553,12 @@ impl RunnableChain for FakeChain {
                 };
             }
             ChainMode::BlockForever => {
+                return PushOutcome::Blocked {
+                    resume_at: from,
+                    reason: BlockReason::Capacity,
+                };
+            }
+            ChainMode::BlockUntil(open) if !open.load(Ordering::Relaxed) => {
                 return PushOutcome::Blocked {
                     resume_at: from,
                     reason: BlockReason::Capacity,

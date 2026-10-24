@@ -48,6 +48,25 @@
 //! feed and the reader must stay empty over a settling window of reads at
 //! most [`END_CHECK_INTERVAL`] apart, and the feed's dead-letter destination
 //! decides between a completed and a stalled job.
+//!
+//! # Stopping
+//!
+//! A backend that [`hands_back`](Feed::hands_back) takes part in a graceful
+//! stop, in this order:
+//!
+//! 1. The source calls [`stop_receiving`](Feed::stop_receiving) when the stop
+//!    begins, and reads on the units it holds, renewing them, until each is
+//!    read to its end or [`STOP_RESERVE`] before the drain deadline.
+//! 2. The source [`hand_back`](Feed::hand_back)s every unit it has not read
+//!    to its end, so another reader can take it at once.
+//! 3. The pipeline drains its sink and acknowledges what the sink has
+//!    acknowledged, under the ack rule.
+//! 4. The runtime calls [`close`](Feed::close), which sends what the backend
+//!    still has queued and gives up what is held, within the time left before
+//!    the deadline.
+//!
+//! A backend that does not hand back skips the reading, and its held units
+//! return through redelivery.
 
 use crate::error::ErrorClass;
 use std::fmt;
@@ -64,6 +83,11 @@ pub use end_check::{END_CHECK_INTERVAL, EndAction, EndCheck, EndOutcome, MarkerR
 /// The settling window a bounded job waits out when its `feed:` section sets
 /// none: five minutes.
 pub const DEFAULT_SETTLING_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// How long before the drain deadline a stopping worker stops reading the
+/// units of a feed that [`hands_back`](Feed::hands_back): five seconds. The
+/// hand-back, the sink drain and the feed's close run in this reserve.
+pub const STOP_RESERVE: Duration = Duration::from_secs(5);
 
 /// One unit of work: an identity and an opaque body the source decodes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -292,6 +316,47 @@ pub trait Feed: Send + Sync {
     fn read_depth(&self, _of: DepthOf) -> Option<DepthReading> {
         None
     }
+
+    /// Whether a stopping worker reads this feed's units to the
+    /// [`STOP_RESERVE`] and hands back the rest, as the module docs'
+    /// "Stopping" order describes. Startup refuses a drain timeout no longer
+    /// than the reserve on a feed that answers `true`. The default returns
+    /// `false`.
+    fn hands_back(&self) -> bool {
+        false
+    }
+
+    /// Receive nothing more: the worker is stopping. Units already buffered
+    /// are the backend's to give back. The default does nothing.
+    fn stop_receiving(&self) {}
+
+    /// Return a held unit for another reader to take at once. The
+    /// delivery does not count as a failure, and the unit does not move to
+    /// the dead-letter destination.
+    ///
+    /// The default accepts the call and leaves the unit held, so it returns
+    /// through redelivery; a backend whose positions move only by commit
+    /// keeps it.
+    ///
+    /// # Errors
+    ///
+    /// [`Gone`](FeedErrorKind::Gone) when the receipt is no longer held.
+    /// [`Retryable`](FeedErrorKind::Retryable) when the backend could not
+    /// take the request now; [`close`](Feed::close) gives the unit up.
+    fn hand_back(&self, _receipt: Receipt) -> Result<(), FeedError> {
+        Ok(())
+    }
+
+    /// Send what the backend still has queued and give up every unit still
+    /// held, within `within`. Called once, after the pipeline's final
+    /// commit. Never waits: the returned [`Confirmation`] settles when the
+    /// backend is done, and a caller stops waiting for it after `within`.
+    ///
+    /// `None` means the backend has nothing to close. The default returns
+    /// `None`.
+    fn close(&self, _within: Duration) -> Option<Confirmation> {
+        None
+    }
 }
 
 /// Where the feed handed to
@@ -478,33 +543,34 @@ pub fn wake_channel() -> (FeedWaker, FeedPark) {
     (FeedWaker(tx.clone()), FeedPark { rx, _tx: tx })
 }
 
-/// The backend's half of a [`Confirmation`]: settles one publish.
+/// The backend's half of a [`Confirmation`]: settles one publish or close.
 ///
 /// Dropping it unsettled resolves the confirmation as
 /// [`Retryable`](FeedErrorKind::Retryable), since the feed may or may not
-/// have stored the unit.
+/// have finished.
 #[derive(Debug)]
 pub struct Confirmer(tokio::sync::oneshot::Sender<Result<(), FeedError>>);
 
 impl Confirmer {
-    /// Report that the feed has stored the unit.
+    /// Report that the feed has stored the unit, or finished closing.
     pub fn confirm(self) {
         // A dropped `Confirmation` means nobody is waiting for the outcome.
         let _ = self.0.send(Ok(()));
     }
 
-    /// Report that the feed did not store the unit, and why.
+    /// Report that the feed did not store the unit or close cleanly, and why.
     pub fn reject(self, error: FeedError) {
         // A dropped `Confirmation` means nobody is waiting for the outcome.
         let _ = self.0.send(Err(error));
     }
 }
 
-/// The outcome of one [`publish`](Feed::publish), once the feed reports it.
+/// The outcome of one [`publish`](Feed::publish) or
+/// [`close`](Feed::close), once the feed reports it.
 ///
 /// Await it, or check it from a synchronous loop with
 /// [`try_outcome`](Confirmation::try_outcome). `Ok(())` means the feed has
-/// stored the unit.
+/// stored the unit, or finished closing.
 #[derive(Debug)]
 pub struct Confirmation {
     rx: tokio::sync::oneshot::Receiver<Result<(), FeedError>>,
@@ -514,7 +580,7 @@ pub struct Confirmation {
 }
 
 impl Confirmation {
-    /// The outcome if the feed has settled the publish, `None` while it is
+    /// The outcome if the feed has settled the call, `None` while it is
     /// pending. Never waits. Once settled, every later call returns the same
     /// outcome.
     pub fn try_outcome(&mut self) -> Option<Result<(), FeedError>> {
@@ -547,8 +613,8 @@ impl Future for Confirmation {
     }
 }
 
-/// A publish's two halves: the backend settles the [`Confirmer`], and the
-/// publisher reads the [`Confirmation`].
+/// A publish's or a close's two halves: the backend settles the
+/// [`Confirmer`], and the caller reads the [`Confirmation`].
 #[must_use]
 pub fn confirmation() -> (Confirmer, Confirmation) {
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -558,7 +624,8 @@ pub fn confirmation() -> (Confirmer, Confirmation) {
 fn unsettled() -> FeedError {
     FeedError::new(
         FeedErrorKind::Retryable,
-        "the feed dropped the publish before settling it; the unit may or may not be stored",
+        "the feed dropped the confirmation before settling it; the publish or close may or may \
+         not have finished",
     )
 }
 
@@ -615,6 +682,19 @@ mod tests {
             FeedErrorKind::Refused
         );
         assert!(feed.read_depth(DepthOf::Feed).is_none());
+        assert!(!feed.hands_back());
+        feed.stop_receiving();
+        assert!(feed.hand_back(Receipt(7)).is_ok());
+        assert!(feed.close(Duration::from_secs(1)).is_none());
+    }
+
+    /// Pins that a backend that does not override the stop methods neither
+    /// hands back nor has anything to close, so a stop drains it as before.
+    #[test]
+    fn a_feed_neither_hands_back_nor_closes_by_default() {
+        assert!(!EmptyFeed.hands_back());
+        assert!(EmptyFeed.hand_back(Receipt(1)).is_ok());
+        assert!(EmptyFeed.close(Duration::ZERO).is_none());
     }
 
     /// Pins that a backend that does not override `read_depth` reports no

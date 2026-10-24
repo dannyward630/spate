@@ -5,11 +5,14 @@
 //! from drivers, commits, and rebalance choreography), so the source
 //! implementation never needs internal locking for the control plane.
 
+use super::runtime::StopRequest;
 use super::{DriverEvent, ExitState, FatalErrorReport, ThreadControl};
 use crate::admin::HealthState;
 use crate::backpressure::InflightBudget;
 use crate::checkpoint::Checkpointer;
+use crate::clock::Clock;
 use crate::error::{ErrorClass, FatalError, SourceError};
+use crate::feed::STOP_RESERVE;
 use crate::metrics::{
     CheckpointMetrics, InflightBudgetMetrics, Meter, PipelineMetrics, PipelineState, SourceMetrics,
 };
@@ -26,6 +29,11 @@ use std::time::{Duration, Instant};
 /// final ack commits within ~a millisecond of resolving, bounded to one
 /// commit interval by the chase deadline.
 const FAST_COMMIT_POLL: Duration = Duration::from_millis(1);
+
+/// How long before the drain deadline the drivers and the sink drain end
+/// when the pipeline's feed hands back, so the feed's close has this time
+/// left inside `checkpoint.drain_timeout`.
+pub(crate) const CLOSE_SHARE: Duration = Duration::from_secs(1);
 
 /// Signals the controller sends the runtime's main thread.
 #[derive(Debug)]
@@ -45,6 +53,9 @@ pub(crate) enum ControllerSignal {
 pub(crate) struct ControllerReport {
     pub state: ExitState,
     pub final_watermarks: Vec<(PartitionId, i64)>,
+    /// The drain deadline, read on the stop clock: the feed's close must end
+    /// by then.
+    pub close_by: Instant,
 }
 
 /// Tuning and wiring for the controller loop.
@@ -55,7 +66,16 @@ pub(crate) struct ControllerContext<S: Source> {
     pub events_rx: crossbeam_channel::Receiver<DriverEvent>,
     pub to_main: crossbeam_channel::Sender<ControllerSignal>,
     pub sink_drained_rx: crossbeam_channel::Receiver<()>,
+    /// Set when a graceful stop is asked for. The loop reads on until the
+    /// source has nothing left to read or the reserve is reached.
+    pub stop: Arc<StopRequest>,
+    /// The drivers' flag, set when the drain begins. A driver abandons a
+    /// blocked batch once it is set.
     pub shutdown: Arc<AtomicBool>,
+    /// The clock a stop's reserve and deadlines are read on.
+    pub stop_clock: Arc<dyn Clock + Send + Sync>,
+    /// [`CLOSE_SHARE`] when the pipeline's feed hands back, else zero.
+    pub close_share: Duration,
     pub health: Arc<HealthState>,
     pub commit_interval: Duration,
     pub drain_timeout: Duration,
@@ -94,7 +114,10 @@ pub(crate) fn run_controller<S: Source>(ctx: ControllerContext<S>) {
         events_rx,
         to_main,
         sink_drained_rx,
+        stop,
         shutdown,
+        stop_clock,
+        close_share,
         health,
         commit_interval,
         drain_timeout,
@@ -122,10 +145,10 @@ pub(crate) fn run_controller<S: Source>(ctx: ControllerContext<S>) {
 
     // Open the source with an issuer handle. A failure here is fatal
     // before any thread has data.
-    let stop = crate::source::StopSignal::new(Arc::clone(&shutdown));
+    let stop_signal = crate::source::StopSignal::new(stop.flag());
     if let Err(e) = source.open(
         SourceCtx::new(checkpointer.handle())
-            .with_stop(stop.clone())
+            .with_stop(stop_signal.clone())
             .with_meter(source_meter)
             .with_stage_metrics(Some(Arc::clone(&source_metrics)))
             .with_partition_detail(per_partition_detail),
@@ -148,8 +171,34 @@ pub(crate) fn run_controller<S: Source>(ctx: ControllerContext<S>) {
     // to mean "everything acknowledged and committed" (see the backstop after
     // the final commit below).
     let mut drained_exit = false;
+    let opened = state.failure.is_none();
+    // Set on the first pass that sees the stop. The loop keeps running while
+    // the source reads on what it holds, until the reserve.
+    let mut stopping: Option<StopTimes> = None;
 
-    while state.failure.is_none() && !shutdown.load(Ordering::Relaxed) {
+    while state.failure.is_none() {
+        if stopping.is_none() && stop.is_set() {
+            let trigger = stop.triggered_at().unwrap_or_else(|| stop_clock.now());
+            stopping = Some(StopTimes::new(trigger, drain_timeout));
+            pipeline_metrics.set_state(PipelineState::Draining);
+        }
+        if let Some(times) = &stopping
+            && (stop_clock.now() >= times.reserve_at || !source.reading_on_stop())
+        {
+            break;
+        }
+        // A revocation during the stop's reading drains its lanes by the
+        // reserve, which the hand-back, the drain and the close run in.
+        let revoke_budget = stopping.as_ref().map_or(drain_timeout, |times| {
+            stop_budget(stop_clock.now(), times.reserve_at, drain_timeout)
+        });
+        let watch = StopWatch {
+            stop: &stop,
+            shutdown: &shutdown,
+            clock: stop_clock.as_ref(),
+            drain_timeout,
+        };
+
         // Driver requests.
         while let Ok(event) = events_rx.try_recv() {
             handle_driver_event(event, &mut source, &mut state);
@@ -235,8 +284,14 @@ pub(crate) fn run_controller<S: Source>(ctx: ControllerContext<S>) {
                     &source_metrics,
                     &pipeline_metrics,
                     &checkpoint_metrics,
-                    drain_timeout,
+                    revoke_budget,
+                    watch,
                 );
+                // An assignment marks the pipeline running; the stop is still
+                // under way.
+                if stopping.is_some() {
+                    pipeline_metrics.set_state(PipelineState::Draining);
+                }
             }
             Ok(SourceEvent::LanesRevoked { lanes, barrier }) => {
                 handle_revoke(
@@ -249,7 +304,8 @@ pub(crate) fn run_controller<S: Source>(ctx: ControllerContext<S>) {
                     &source_metrics,
                     &checkpoint_metrics,
                     &health,
-                    drain_timeout,
+                    revoke_budget,
+                    watch,
                 );
             }
             Ok(SourceEvent::LanesRetired { lanes }) => {
@@ -346,29 +402,43 @@ pub(crate) fn run_controller<S: Source>(ctx: ControllerContext<S>) {
     }
 
     // ---- Drain sequence (shutdown or failure; see graceful-shutdown.mdx) ----
-    // Failure-initiated drains must set the process shutdown flag too.
-    // Drivers wedged in the blocked-batch retry loop only observe that flag,
-    // and main joins them without a timeout, so without this store a chain
-    // failure elsewhere leaves a blocked driver spinning forever.
+    // Every drain sets the drivers' flag here, a stop's only once its reading
+    // ends, so a batch blocked during the reading keeps retrying. Drivers
+    // wedged in the blocked-batch retry loop only observe that flag, and main
+    // joins them without a timeout, so without this store a chain failure
+    // elsewhere leaves a blocked driver spinning forever.
     shutdown.store(true, Ordering::Relaxed);
     // The drain's commits, the final one included, run with the signal clear.
-    stop.close();
+    stop_signal.close();
     pipeline_metrics.set_state(if state.failure.is_some() {
         PipelineState::Failed
     } else {
         PipelineState::Draining
     });
-    let deadline = Instant::now() + drain_timeout;
+    // Hand back what the stop's reading did not finish, before the drivers
+    // drain, so a peer can take it while this instance drains its sink. A
+    // failed run reads nothing more and hands back at once.
+    if opened
+        && !drained_exit
+        && let Err(e) = source.stop_reading()
+    {
+        tracing::warn!(error = %e, "the source could not hand back the units it holds");
+    }
+    // A graceful stop's deadline counts from its trigger, so the reading
+    // above spends from the same `drain_timeout`.
+    let deadline =
+        stopping.map_or_else(|| stop_clock.now() + drain_timeout, |times| times.deadline);
+    let lanes_by = lanes_deadline(stop_clock.now(), deadline, close_share);
 
     // Every driver flushes its chain, drops its lanes, and arrives.
     let barrier = DrainBarrier::new(control_txs.len());
     for tx in &control_txs {
         let _ = tx.send(ThreadControl::Shutdown {
             barrier: barrier.clone(),
-            deadline,
+            deadline: lanes_by,
         });
     }
-    if !barrier.wait(drain_timeout) {
+    if !barrier.wait(lanes_by.saturating_duration_since(stop_clock.now())) {
         tracing::error!(
             remaining = barrier.remaining(),
             "drivers did not finish draining before the deadline"
@@ -393,9 +463,9 @@ pub(crate) fn run_controller<S: Source>(ctx: ControllerContext<S>) {
     // Hand over to main, which joins the driver threads (dropping
     // their chains closes the shard queues) and drains the sink.
     let _ = to_main.send(ControllerSignal::LanesDrained {
-        sink_deadline: deadline,
+        sink_deadline: lanes_by,
     });
-    let sink_budget = deadline.saturating_duration_since(Instant::now()) + Duration::from_secs(2);
+    let sink_budget = lanes_by.saturating_duration_since(stop_clock.now()) + Duration::from_secs(2);
     if sink_drained_rx.recv_timeout(sink_budget).is_err() {
         tracing::error!("sink drain did not report before the deadline");
     }
@@ -472,8 +542,93 @@ pub(crate) fn run_controller<S: Source>(ctx: ControllerContext<S>) {
             None => ExitState::Completed,
         },
         final_watermarks: state.committed.into_iter().collect(),
+        close_by: deadline,
     };
     let _ = to_main.send(ControllerSignal::Finished(report));
+}
+
+/// How often a revocation's wait looks for a stop.
+const STOP_POLL: Duration = Duration::from_millis(10);
+
+/// What a revocation needs to end its wait for a stop.
+#[derive(Clone, Copy)]
+struct StopWatch<'a> {
+    stop: &'a StopRequest,
+    shutdown: &'a AtomicBool,
+    clock: &'a (dyn Clock + Send + Sync),
+    drain_timeout: Duration,
+}
+
+impl StopWatch<'_> {
+    /// Whether a stop is under way that the drivers must serve now: its
+    /// source reads nothing on, or its reserve is reached.
+    fn ends_the_wait<S: Source>(&self, source: &mut S) -> bool {
+        if !self.stop.is_set() {
+            return false;
+        }
+        let trigger = self.stop.triggered_at().unwrap_or_else(|| self.clock.now());
+        let times = StopTimes::new(trigger, self.drain_timeout);
+        self.clock.now() >= times.reserve_at || !source.reading_on_stop()
+    }
+}
+
+/// Wait for a revocation's `barrier` until `deadline`. A stop that the
+/// drivers must serve now sets their flag, as the drain does, so a driver
+/// held by a blocked batch abandons it for replay and arrives.
+fn wait_revocation<S: Source>(
+    barrier: &DrainBarrier,
+    deadline: Instant,
+    source: &mut S,
+    watch: StopWatch<'_>,
+) -> bool {
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if barrier.wait(left.min(STOP_POLL)) {
+            return true;
+        }
+        if left <= STOP_POLL {
+            return false;
+        }
+        if !watch.shutdown.load(Ordering::Relaxed) && watch.ends_the_wait(source) {
+            watch.shutdown.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The instants a graceful stop runs to, both counted from its trigger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StopTimes {
+    /// When the source stops reading: [`STOP_RESERVE`] before the deadline,
+    /// and never before the trigger.
+    reserve_at: Instant,
+    /// The drain deadline: the trigger plus `checkpoint.drain_timeout`.
+    deadline: Instant,
+}
+
+impl StopTimes {
+    fn new(trigger: Instant, drain_timeout: Duration) -> StopTimes {
+        let deadline = trigger + drain_timeout;
+        let reserve_at = deadline
+            .checked_sub(STOP_RESERVE)
+            .map_or(trigger, |at| at.max(trigger));
+        StopTimes {
+            reserve_at,
+            deadline,
+        }
+    }
+}
+
+/// `fresh`, cut so that it ends by `deadline`.
+fn stop_budget(now: Instant, deadline: Instant, fresh: Duration) -> Duration {
+    fresh.min(deadline.saturating_duration_since(now))
+}
+
+/// The instant the drivers and the sink drain end by: `close_share` before
+/// `deadline`, and never before `now`.
+fn lanes_deadline(now: Instant, deadline: Instant, close_share: Duration) -> Instant {
+    deadline
+        .checked_sub(close_share)
+        .map_or(now, |by| by.max(now))
 }
 
 struct State {
@@ -710,6 +865,7 @@ fn handle_assign<S: Source>(
     pipeline_metrics: &PipelineMetrics,
     checkpoint_metrics: &CheckpointMetrics,
     drain_timeout: Duration,
+    watch: StopWatch<'_>,
 ) {
     if !state.assignment.is_empty() {
         tracing::warn!(
@@ -729,6 +885,7 @@ fn handle_assign<S: Source>(
             checkpoint_metrics,
             health,
             drain_timeout,
+            watch,
         );
     }
 
@@ -834,6 +991,7 @@ fn handle_revoke<S: Source>(
     checkpoint_metrics: &CheckpointMetrics,
     health: &Arc<HealthState>,
     drain_timeout: Duration,
+    watch: StopWatch<'_>,
 ) {
     source_metrics.rebalance_revoked();
     revoke_lanes(
@@ -846,6 +1004,7 @@ fn handle_revoke<S: Source>(
         checkpoint_metrics,
         health,
         drain_timeout,
+        watch,
     );
     source_metrics.set_lanes_active(state.assignment.len());
 }
@@ -919,6 +1078,7 @@ fn revoke_lanes<S: Source>(
     checkpoint_metrics: &CheckpointMetrics,
     health: &Arc<HealthState>,
     drain_timeout: Duration,
+    watch: StopWatch<'_>,
 ) {
     let deadline = Instant::now() + drain_timeout;
     let mut by_thread: HashMap<usize, Vec<LaneId>> = HashMap::new();
@@ -940,7 +1100,7 @@ fn revoke_lanes<S: Source>(
             deadline,
         });
     }
-    if !barrier.wait(drain_timeout) {
+    if !wait_revocation(&barrier, deadline, source, watch) {
         tracing::error!(
             remaining = barrier.remaining(),
             "lane drain did not finish before the deadline; unflushed \
@@ -982,4 +1142,52 @@ fn revoke_lanes<S: Source>(
         .filter(|p| !live_partitions.contains(p))
         .collect();
     checkpointer.revoke(&to_revoke);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins that the reserve sits `STOP_RESERVE` before the deadline, and at
+    /// the trigger when the drain timeout is shorter than the reserve.
+    #[test]
+    fn a_stop_reads_to_the_reserve_before_its_deadline() {
+        let trigger = Instant::now();
+        let times = StopTimes::new(trigger, Duration::from_secs(25));
+        assert_eq!(times.deadline, trigger + Duration::from_secs(25));
+        assert_eq!(times.reserve_at, trigger + Duration::from_secs(20));
+        let short = StopTimes::new(trigger, Duration::from_secs(3));
+        assert_eq!(short.reserve_at, trigger);
+        assert_eq!(short.deadline, trigger + Duration::from_secs(3));
+    }
+
+    /// Pins that a budget is cut to what is left before the deadline, and is
+    /// zero past it.
+    #[test]
+    fn a_stop_budget_ends_by_the_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(4);
+        let fresh = Duration::from_secs(10);
+        assert_eq!(stop_budget(now, deadline, fresh), Duration::from_secs(4));
+        assert_eq!(stop_budget(now, now + fresh * 2, fresh), fresh);
+        assert_eq!(
+            stop_budget(deadline + fresh, deadline, fresh),
+            Duration::ZERO
+        );
+    }
+
+    /// Pins that the lanes end the close's share before the deadline, and
+    /// never before now.
+    #[test]
+    fn the_lanes_leave_the_close_its_share() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(10);
+        assert_eq!(
+            lanes_deadline(now, deadline, CLOSE_SHARE),
+            deadline - CLOSE_SHARE
+        );
+        assert_eq!(lanes_deadline(now, deadline, Duration::ZERO), deadline);
+        let late = deadline - Duration::from_millis(500);
+        assert_eq!(lanes_deadline(late, deadline, CLOSE_SHARE), late);
+    }
 }
