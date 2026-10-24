@@ -157,12 +157,15 @@ impl Gate {
 
     /// Every delivery waiting at the gate, counted into `admitting`, after
     /// waiting up to one step for one to arrive. None once the feed stops
-    /// or latches.
+    /// receiving, stops or latches: a delivery left at the gate gets no
+    /// attempt record, and the next owner of its partition reads it.
     fn take(&self) -> Vec<Gating> {
         let mut st = self.core.lock();
         // Checked under the state lock that `on_message` pushes under and
-        // `Drop` stores the stop flag under, so neither wake is missed.
-        if st.gating.is_empty() && st.fatal.is_none() && !self.core.stopped() {
+        // `stop` stores the stop flag under, so neither wake is missed. A
+        // stopping feed waits too, so the loop does not spin over
+        // deliveries it will not take.
+        if (st.gating.is_empty() || st.stopping) && st.fatal.is_none() && !self.core.stopped() {
             st = self
                 .core
                 .gate_wake
@@ -170,7 +173,7 @@ impl Gate {
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
-        if self.core.stopped() || st.fatal.is_some() {
+        if st.stopping || self.core.stopped() || st.fatal.is_some() {
             return Vec::new();
         }
         let entries: Vec<Gating> = st.gating.drain(..).collect();
@@ -422,9 +425,18 @@ impl Gate {
 /// below the attempt cap, with its receipt still held, or its move to the
 /// dead-letter topic at the cap, with its receipt released. `None`, giving
 /// back its share of `admitting`, when its partition was given up or the
-/// copy was replaced since.
+/// copy was replaced since, and when the feed has stopped receiving, which
+/// puts `entry` back at the gate with no attempt recorded.
 pub(crate) fn admission(core: &Core, entry: Gating) -> Option<Write> {
     let mut st = core.lock();
+    // A pass that took its deliveries before the stop admits none of them.
+    if st.stopping {
+        st.admitting = st.admitting.saturating_sub(1);
+        if st.tracker.held(entry.receipt).is_some() {
+            st.gating.push_back(entry);
+        }
+        return None;
+    }
     // The state lock first, then the ledger's.
     let count = attempt::lock(&core.ledger).count(entry.identity.as_bytes());
     let partition = partition_of(entry.identity.as_bytes(), core.attempt_partitions);
