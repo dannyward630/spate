@@ -106,12 +106,41 @@ fn delete_rejected(e: &object_store::Error) -> bool {
         && text.ends_with("(code: AccessDenied)")
 }
 
-/// `e`'s message, with the TLS rejection behind it appended.
-pub(crate) fn reason(e: &object_store::Error) -> String {
-    match spate_core::tls_rejection!(rustls, e) {
-        Some(tls) => format!("{e}: {tls}"),
-        None => e.to_string(),
+/// The most of a store's response body an S3 source error carries. A store
+/// can answer an error with a body of any size, which `object_store` quotes
+/// whole.
+const ERROR_TEXT_MAX_CHARS: usize = 512;
+
+/// The text `object_store` writes between the request it sent and the status
+/// and response body the store answered.
+const STATUS_MARKER: &str = "Server returned non-2xx status code: ";
+
+/// `e`'s message with the store's response body cut to
+/// [`ERROR_TEXT_MAX_CHARS`] characters, with `…` where it was cut, and the TLS
+/// rejection behind it appended whole.
+///
+/// The request and the status ahead of the body are kept whole: the request
+/// URI holds the key, which can encode past the bound and would otherwise
+/// leave no status to read. A message that quotes no response body is cut
+/// whole at the same bound.
+pub(crate) fn bounded_reason(e: &object_store::Error) -> String {
+    let mut text = e.to_string();
+    let body = text
+        .find(STATUS_MARKER)
+        .map(|at| at + STATUS_MARKER.len())
+        .map_or(0, |status| {
+            text[status..]
+                .find(": ")
+                .map_or(text.len(), |end| status + end + 2)
+        });
+    if let Some((cut, _)) = text[body..].char_indices().nth(ERROR_TEXT_MAX_CHARS) {
+        text.truncate(body + cut);
+        text.push('…');
     }
+    if let Some(tls) = spate_core::tls_rejection!(rustls, e) {
+        text = format!("{text}: {tls}");
+    }
+    text
 }
 
 /// Whether `e`, failing a read of a part from `origin`, means the key was
@@ -389,6 +418,36 @@ mod tests {
             .unwrap_err()
     }
 
+    /// Pins `object_store`'s wording around a store's answer, which
+    /// [`STATUS_MARKER`] matches: a 503 read of a key that encodes past the
+    /// bound keeps the request URI and the status whole and cuts the body.
+    #[tokio::test]
+    async fn a_long_encoded_key_keeps_the_status_and_cuts_the_body() {
+        use object_store::ObjectStore as _;
+        let body = format!(
+            "<Error><Code>SlowDown</Code><Message>{}</Message></Error>",
+            "x".repeat(64 * 1024)
+        );
+        let url = crate::test_servers::sequence_server(vec![("503 Service Unavailable", body)]);
+        let store = crate::test_servers::store_at(&url);
+        let key = format!("p/{}", "数".repeat(60));
+        let e = store
+            .get_opts(&key.as_str().into(), object_store::GetOptions::default())
+            .await
+            .unwrap_err();
+        let status = format!("{STATUS_MARKER}503 Service Unavailable: ");
+        assert!(e.to_string().contains(&status), "{e}");
+        let shown = bounded_reason(&e);
+        let (request, text) = shown.split_once(&status).expect("the status is kept");
+        assert!(
+            request.chars().count() > ERROR_TEXT_MAX_CHARS,
+            "the request is kept whole: {request}"
+        );
+        assert!(text.starts_with("<Error><Code>SlowDown</Code>"), "{text}");
+        assert_eq!(text.chars().count(), 512 + 1, "{text}");
+        assert!(text.ends_with('…'), "{text}");
+    }
+
     /// A TLS alert that rejects the handshake is `Fatal` and pipeline-fatal on
     /// a listing and a read, and the reason names it; `decode_error` stays
     /// `Retryable`.
@@ -409,7 +468,7 @@ mod tests {
                 assert_eq!(classify(&e), expected, "{e:?}");
                 assert_eq!(is_pipeline_fatal(&e), expected == ErrorClass::Fatal, "{e}");
                 if expected == ErrorClass::Fatal {
-                    assert!(reason(&e).contains(&name), "{}", reason(&e));
+                    assert!(bounded_reason(&e).contains(&name), "{}", bounded_reason(&e));
                 }
             }
         }
@@ -434,7 +493,11 @@ mod tests {
                 ),
                 "{e:?}"
             );
-            assert!(reason(&e).contains("UnknownIssuer"), "{}", reason(&e));
+            assert!(
+                bounded_reason(&e).contains("UnknownIssuer"),
+                "{}",
+                bounded_reason(&e)
+            );
         }
     }
 
@@ -447,7 +510,45 @@ mod tests {
         let url = crate::test_servers::serve(&server, Some(&clients)).await;
         let e = list_error(&crate::test_servers::tls_store_at(&url, &server)).await;
         assert_eq!(classify(&e), ErrorClass::Fatal, "{e:?}");
-        assert!(reason(&e).contains("CertificateRequired"), "{}", reason(&e));
+        assert!(
+            bounded_reason(&e).contains("CertificateRequired"),
+            "{}",
+            bounded_reason(&e)
+        );
+    }
+
+    /// Pins the bound's edge: an error of exactly 512 characters is kept
+    /// whole, and one of 513 is cut to 512 and `…`, on ASCII and multibyte
+    /// text alike.
+    #[test]
+    fn the_bound_keeps_512_characters_whole_and_cuts_513() {
+        let generic = |text: String| object_store::Error::Generic {
+            store: "S3",
+            source: text.into(),
+        };
+        let head = generic(String::new()).to_string().chars().count();
+        let exact = generic("x".repeat(512 - head));
+        assert_eq!(bounded_reason(&exact), exact.to_string());
+        for tail in ["x", "é"] {
+            let over = generic(format!("{}{tail}", "x".repeat(512 - head)));
+            let want = over.to_string().chars().take(512).collect::<String>() + "…";
+            assert_eq!(bounded_reason(&over), want);
+        }
+    }
+
+    /// The TLS rejection behind a long error is named after the cut.
+    #[test]
+    fn a_long_error_keeps_its_tls_rejection() {
+        let e = object_store::Error::Generic {
+            store: "S3",
+            source: Box::new(crate::test_servers::LongTls(rustls::Error::AlertReceived(
+                rustls::AlertDescription::HandshakeFailure,
+            ))),
+        };
+        let shown = bounded_reason(&e);
+        assert!(shown.contains("HandshakeFailure"), "{shown}");
+        assert!(shown.contains('…'), "{shown}");
+        assert!(shown.len() < 1024, "{} bytes", shown.len());
     }
 
     fn notification(version: Option<&str>) -> Origin {

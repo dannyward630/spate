@@ -10,7 +10,7 @@
 //! compares at the start and the end of a settling window.
 
 use crate::config::Compression;
-use crate::error::{classify, reason};
+use crate::error::{bounded_reason, classify};
 use bytes::Bytes;
 use futures_util::StreamExt as _;
 use futures_util::future::{Either, select};
@@ -351,10 +351,6 @@ pub(crate) async fn read_end(
     }
 }
 
-/// The most of a store's error text a location error carries. A store can
-/// answer an error with a body of any size, which `object_store` quotes.
-const ERROR_TEXT_MAX_CHARS: usize = 512;
-
 /// An `object_store` failure on `object`, classed by [`classify`].
 pub(crate) fn io_error(location: &Location, object: &Path, e: &object_store::Error) -> SourceError {
     error_with(location, object, e, "")
@@ -374,16 +370,6 @@ pub(crate) fn read_error(
         ""
     };
     error_with(location, object, e, hint)
-}
-
-/// [`reason`] cut to [`ERROR_TEXT_MAX_CHARS`], with `…` where it was cut.
-pub(crate) fn bounded_reason(e: &object_store::Error) -> String {
-    let mut text = reason(e);
-    if let Some((cut, _)) = text.char_indices().nth(ERROR_TEXT_MAX_CHARS) {
-        text.truncate(cut);
-        text.push('…');
-    }
-    text
 }
 
 fn error_with(
@@ -1101,5 +1087,26 @@ mod tests {
             reason.contains("s3://ops/jobs/a/") && reason.contains("403"),
             "{reason}"
         );
+    }
+
+    /// Pins that a location error on a long store error names the TLS
+    /// rejection behind it after the cut, with the hint after that.
+    #[test]
+    fn a_long_store_error_keeps_its_tls_rejection_at_the_job_location() {
+        let location = accepted("s3://ops/jobs/a/");
+        let e = object_store::Error::Generic {
+            store: "S3",
+            source: Box::new(crate::test_servers::LongTls(rustls::Error::AlertReceived(
+                rustls::AlertDescription::HandshakeFailure,
+            ))),
+        };
+        for shown in [
+            read_error(&location, &location.fingerprint(), &e).to_string(),
+            io_error(&location, &location.fingerprint(), &e).to_string(),
+        ] {
+            assert!(shown.contains("…: "), "{shown}");
+            assert!(shown.contains("HandshakeFailure"), "{shown}");
+            assert!(shown.len() < 1024, "{} bytes", shown.len());
+        }
     }
 }
