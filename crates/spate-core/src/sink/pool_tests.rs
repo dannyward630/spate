@@ -1653,7 +1653,7 @@ fn replica_errors_attribute_failures_asymmetrically() {
     );
 }
 
-/// The scenario behind #79, reproduced: two batches, one sink speed, two very
+/// The scenario reproduced: two batches, one sink speed, two very
 /// different flush durations. `spate_sink_flush_duration_seconds` spans seal to
 /// settle, so the second batch (sealed at t=0, unable to start until the first
 /// released the shard's only in-flight permit at t=2) reads twice what the
