@@ -23,7 +23,7 @@ const READS: [&str; 10] = [
 ];
 
 /// The keys the workflow reads, in the order the block writes them.
-const KEYS: [&str; 13] = [
+const KEYS: [&str; 14] = [
     "rust",
     "site",
     "fuzz",
@@ -35,6 +35,7 @@ const KEYS: [&str; 13] = [
     "manifests",
     "advisories",
     "release-tooling",
+    "macos",
     "bench-shards",
     "clickhouse-lanes",
 ];
@@ -52,6 +53,7 @@ const SITE_ONLY: &str = "rust=false\n\
      manifests=false\n\
      advisories=false\n\
      release-tooling=false\n\
+     macos=false\n\
      bench-shards=[]\n\
      clickhouse-lanes=[]\n";
 
@@ -102,6 +104,7 @@ fn force_all() -> String {
     assert_eq!(field(&block, "rust"), "true");
     assert_eq!(field(&block, "manifests"), "true");
     assert_eq!(field(&block, "advisories"), "true");
+    assert_eq!(field(&block, "macos"), "true");
     block
 }
 
@@ -210,6 +213,36 @@ fn a_path_list_classifies_as_a_pull_request_under_any_event() {
         SITE_ONLY,
         "",
     );
+}
+
+/// A merge-queue entry whose base cannot be resolved runs everything, the
+/// macOS lane included.
+#[test]
+fn an_unresolvable_merge_group_runs_everything() {
+    held(
+        &["ci-changes"],
+        &[("EVENT_NAME", "merge_group")],
+        0,
+        &format!("note: no usable diff; running everything.\n{}", force_all()),
+        "",
+    );
+}
+
+/// A lockfile change selects the macOS lane on a pull request, and a crate
+/// source change leaves it to the merge queue.
+#[test]
+fn a_lockfile_path_reaches_the_macos_block() {
+    let dir = Dir::new("a_lockfile_path_reaches_the_macos_block");
+    for (paths, macos) in [
+        (&b"Cargo.lock\0"[..], "true"),
+        (&b"crates/spate-core/src/lib.rs\0"[..], "false"),
+    ] {
+        let list = dir.write("paths", paths);
+        let got = xtask(&["ci-changes", "--classify-paths", &list], &[]);
+        assert_eq!(got.status.code(), Some(0));
+        let block = String::from_utf8(got.stdout).unwrap();
+        assert_eq!(field(&block, "macos"), macos, "{block}");
+    }
 }
 
 /// A path list that cannot be read names the file and the reason, and writes
@@ -1101,6 +1134,38 @@ fn the_arm64_lane_runs_what_the_x64_jobs_run() {
         }
     }
     assert_eq!(nextest(arm64), expected);
+}
+
+/// The macOS lane runs the arm64 lane's workspace suite on its own runner,
+/// gated by the classifier's `macos` key alone, and lets no failure through
+/// to `CI gate`.
+#[test]
+fn the_macos_lane_runs_what_the_arm64_lane_runs() {
+    let tests = yaml(&read_workflow("tests.yml"));
+    let arm64 = &tests["jobs"]["test-arm64"];
+    let macos = &tests["jobs"]["test-macos"];
+    assert_eq!(macos["runs-on"].as_str(), Some("macos-26"));
+    assert_eq!(macos["if"].as_str(), Some("inputs.macos == 'true'"));
+    assert!(macos["timeout-minutes"].as_u64().is_some());
+    assert!(macos.get("continue-on-error").is_none());
+    // Every step matches once the check and artifact names, which differ per
+    // lane, are set aside.
+    let steps = |job: &serde_yaml::Value| -> Vec<serde_yaml::Value> {
+        let mut steps = job["steps"].as_sequence().unwrap().clone();
+        for step in &mut steps {
+            assert!(step.get("continue-on-error").is_none(), "{step:?}");
+            let uses = step["uses"].as_str().unwrap_or_default().to_owned();
+            if let Some(with) = step.get_mut("with").and_then(|w| w.as_mapping_mut()) {
+                if uses.starts_with("mikepenz/action-junit-report@") {
+                    with.remove("check_name");
+                } else if uses.starts_with("actions/upload-artifact@") {
+                    with.remove("name");
+                }
+            }
+        }
+        steps
+    };
+    assert_eq!(steps(macos), steps(arm64));
 }
 
 /// Each JUnit check and artifact in a CI run has its own name: upload-artifact
