@@ -165,7 +165,6 @@ ClickHouse pattern).
 | [`spate-sqs`](https://crates.io/crates/spate-sqs) | `sqs` | Amazon SQS work feed: units in a standard queue, renewed while a worker reads them and deleted once every record is written. |
 | [`spate-avro`](https://crates.io/crates/spate-avro) | `avro` | Avro deserialization: Confluent wire format, async schema-registry fetching that never blocks a pipeline thread. |
 | [`spate-json`](https://crates.io/crates/spate-json) | `json` | JSON deserialization: single, NDJSON and array framings, with an optional SIMD backend. |
-| [`spate-coordination`](https://crates.io/crates/spate-coordination) | `coordination` | Multi-instance work assignment: leader-computed sticky assignment over a pluggable store. |
 | [`spate-datagen`](https://crates.io/crates/spate-datagen) | `datagen` | Synthetic storefront-event source: referentially consistent orders, payments and refunds, with no broker or bucket to stand up first. A demo and test source; it keeps no durable progress. |
 
 And the framework itself:
@@ -195,14 +194,11 @@ on the same quiet hardware, and a shared CI runner is not that.
 
 ## Testing
 
-proptest covers the checkpoint tracker, the codecs and the assignment
-protocol across seven crates. loom models the tracker's concurrency
+proptest covers the checkpoint tracker and the codecs across seven crates. loom models the tracker's concurrency
 directly; that module stays synchronous and free of async
 runtime types. Kafka runs against librdkafka's `MockCluster` on every pull
 request; brokers, ClickHouse and object stores run against real containers
-whenever a change reaches them, and on a schedule regardless. The
-work-assignment invariants each
-[name the property test that enforces them](docs/user-guide/02-concepts/08-work-assignment.mdx).
+whenever a change reaches them, and on a schedule regardless.
 
 The most useful contribution is one that proves a delivery guarantee wrong.
 

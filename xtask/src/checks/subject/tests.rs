@@ -18,13 +18,7 @@ fn verdict(subject: &str) -> String {
 #[test]
 fn a_crate_area_is_its_directory_less_the_prefix() {
     let areas = tree_areas();
-    for area in [
-        "core",
-        "kafka",
-        "clickhouse-derive",
-        "coordination",
-        "spate",
-    ] {
+    for area in ["core", "kafka", "clickhouse-derive", "sqs", "spate"] {
         assert!(
             areas.iter().any(|a| a == area),
             "{area} missing from {areas:?}"
@@ -47,7 +41,7 @@ fn the_rule_over_a_table_of_subjects() {
             "ok",
         ),
         ("core: `Clock` moves into spate_core::clock", "ok"),
-        ("coordination: make a TLS alert fatal", "ok"),
+        ("sqs: make a TLS alert fatal", "ok"),
         ("spate: re-export the clock module", "ok"),
         (
             "workspace: bump the cargo group across 1 directory with 5 updates",
