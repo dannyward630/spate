@@ -1,0 +1,5 @@
+# GitHub-hosted runner labels newer than actionlint's built-in list. The
+# self-hosted list is the only way actionlint accepts an unknown label.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04-arm
