@@ -6,7 +6,7 @@
 //! notification, which [`decode`](crate::unit::decode) reads into one part per
 //! created object. A notification with no object to read is acknowledged, and
 //! one the source cannot read is failed back. A whole-object part over an
-//! object the planner would cut is read in the ranges
+//! object the lister would cut is read in the ranges
 //! [`parts_of`](crate::unit::parts_of) yields, each opened when there is room
 //! for it. Every part opens its own lane and partition and resumes from no
 //! committed position, so a redelivery and a duplicate are each read in
@@ -54,12 +54,11 @@ use crate::fetch::{FetcherParams, run_fetcher};
 use crate::framer::FramerFactory;
 use crate::job_end::JobEnd;
 use crate::lane::S3Lane;
+use crate::lane_ctx::{LANE_HANDOFF_CHUNKS, LaneLabel, PoisonReport, SplitTracker};
 use crate::metrics::S3Metrics;
 use crate::split::Packing;
-use crate::split_ctx::{LANE_HANDOFF_CHUNKS, PoisonReport, SplitTracker};
 use crate::unit::{Cursor, Decoded, Origin, Part, Scope, decode, re_enqueue_body};
 use spate_core::checkpoint::AckIssuer;
-use spate_core::coordination::{LeaseEpoch, SplitId};
 use spate_core::error::SourceError;
 use spate_core::feed::{
     Confirmation, Delivery, Feed, FeedError, FeedErrorKind, FeedPark, FeedWaker, Receipt, Unit,
@@ -516,6 +515,16 @@ impl UnitReader {
         }
     }
 
+    /// Whether the held lane `lane` is paused, or `None` when no held lane has
+    /// that id.
+    #[cfg(test)]
+    pub(crate) fn is_paused(&self, lane: LaneId) -> Option<bool> {
+        self.lanes
+            .values()
+            .find(|l| l.lane == lane)
+            .map(|l| l.pause.load(Ordering::Relaxed))
+    }
+
     /// Settle what the lanes and the feed left since the last poll (poison
     /// reports, refused fails, finished lanes and units), then renew every
     /// unit still held.
@@ -605,13 +614,13 @@ impl UnitReader {
     fn read_reports(&mut self) {
         while let Ok(report) = self.poison_rx.try_recv() {
             if let Some(overwrite) = report.overwrite {
-                self.on_overwrite(PartitionId(report.epoch.0 as u32), *overwrite);
+                self.on_overwrite(report.partition, *overwrite);
                 continue;
             }
             if let Some(m) = &self.parts.metrics {
                 m.objects_failed(report.kind).increment(1);
             }
-            let partition = PartitionId(report.epoch.0 as u32);
+            let partition = report.partition;
             let Some(lane) = self.lanes.get(&partition) else {
                 continue;
             };
@@ -865,8 +874,7 @@ impl UnitReader {
         self.next_lane = n.checked_add(1).expect("lane sequence exhausted (u32)");
         let partition = PartitionId(n);
         let lane = LaneId(n);
-        let split = SplitId::new(format!("delivery-{delivery}-lane-{n}"))
-            .expect("a lane name is a valid id");
+        let label: LaneLabel = format!("delivery-{delivery}-lane-{n}").into();
         let parts = &self.parts;
         let tracker = Arc::new(SplitTracker::new());
         let pause = Arc::new(AtomicBool::new(false));
@@ -877,7 +885,7 @@ impl UnitReader {
         };
         // Detached: the fetcher exits when the lane drops its receiver.
         drop(parts.handle.spawn(run_fetcher(FetcherParams {
-            split: split.clone(),
+            split: label.clone(),
             store: Arc::clone(&parts.store),
             slice: part.object,
             start_ordinal: 0,
@@ -886,11 +894,6 @@ impl UnitReader {
             range_bytes: parts.range_bytes,
             tx,
             pause: Arc::clone(&pause),
-            // A held lane's fetcher is never stopped: stopped before its
-            // object starts, the lane ends at terminal 0 and its unit is
-            // acknowledged unread. A handed-back lane's fetcher ends when the
-            // drain drops the lane.
-            stop: Arc::new(AtomicBool::new(false)),
             retry_base: parts.retry_base,
             retries: parts.metrics.as_ref().map(|m| m.get_retries.clone()),
             range: part.range,
@@ -909,9 +912,6 @@ impl UnitReader {
             parts.packing.compression,
             Arc::clone(&parts.make_framer),
             None,
-            split,
-            // Names the lane in poison reports.
-            LeaseEpoch(u64::from(n)),
             Arc::clone(&tracker),
             self.poison_tx.clone(),
             self.waker.clone(),
@@ -970,8 +970,8 @@ fn feed_error(doing: &str, e: &FeedError) -> SourceError {
 mod tests {
     use super::*;
     use crate::config::Compression;
+    use crate::lane_ctx::PoisonKind;
     use crate::split::{DescriptorObject, SplitDescriptor};
-    use crate::split_ctx::PoisonKind;
     use crate::testutil::TestLineFramer;
     use spate_core::checkpoint::Checkpointer;
     use spate_core::clock::tokio::{Clock, TestClock};
@@ -1882,8 +1882,7 @@ mod tests {
                     reader
                         .poison_tx
                         .send(PoisonReport {
-                            split: SplitId::new("delivery-0-lane-0").unwrap(),
-                            epoch: LeaseEpoch(u64::from(lanes[0].0)),
+                            partition: PartitionId(lanes[0].0),
                             kind: PoisonKind::NotFound,
                             reason: "gone".into(),
                             overwrite: None,
@@ -1966,8 +1965,7 @@ mod tests {
                     reader
                         .poison_tx
                         .send(PoisonReport {
-                            split: SplitId::new("delivery-0-lane-0").unwrap(),
-                            epoch: LeaseEpoch(u64::from(lanes[0].partition().0)),
+                            partition: PartitionId(lanes[0].partition().0),
                             kind: PoisonKind::NotFound,
                             reason: "gone".into(),
                             overwrite: None,
@@ -2132,8 +2130,7 @@ mod tests {
         reader
             .poison_tx
             .send(PoisonReport {
-                split: SplitId::new("delivery-1-lane-1").unwrap(),
-                epoch: LeaseEpoch(u64::from(range.0)),
+                partition: PartitionId(range.0),
                 kind: PoisonKind::NotFound,
                 reason: "gone".into(),
                 overwrite: None,
@@ -2219,8 +2216,7 @@ mod tests {
         reader
             .poison_tx
             .send(PoisonReport {
-                split: SplitId::new("poisoned").unwrap(),
-                epoch: LeaseEpoch(u64::from(partition.0)),
+                partition,
                 kind: PoisonKind::NotFound,
                 reason: "gone".into(),
                 overwrite: None,
@@ -2809,8 +2805,7 @@ mod tests {
         reader
             .poison_tx
             .send(PoisonReport {
-                split: SplitId::new("overwritten").unwrap(),
-                epoch: LeaseEpoch(u64::from(partition.0)),
+                partition,
                 kind: PoisonKind::EtagDrift,
                 reason: "overwritten".into(),
                 overwrite: Some(Box::new(Overwrite {
@@ -2986,8 +2981,7 @@ mod tests {
         reader
             .poison_tx
             .send(PoisonReport {
-                split: SplitId::new("gone").unwrap(),
-                epoch: LeaseEpoch(u64::from(lanes[1].0)),
+                partition: PartitionId(lanes[1].0),
                 kind: PoisonKind::NotFound,
                 reason: "gone".into(),
                 overwrite: None,
@@ -3228,8 +3222,7 @@ mod tests {
             reader
                 .poison_tx
                 .send(PoisonReport {
-                    split: SplitId::new("gone").unwrap(),
-                    epoch: LeaseEpoch(u64::from(lanes[1].0)),
+                    partition: PartitionId(lanes[1].0),
                     kind: PoisonKind::NotFound,
                     reason: "gone".into(),
                     overwrite: None,
@@ -3322,8 +3315,7 @@ mod tests {
         reader
             .poison_tx
             .send(PoisonReport {
-                split: SplitId::new("gone").unwrap(),
-                epoch: LeaseEpoch(u64::from(px.0)),
+                partition: PartitionId(px.0),
                 kind: PoisonKind::NotFound,
                 reason: "gone".into(),
                 overwrite: None,
@@ -3335,8 +3327,7 @@ mod tests {
         let tracker = Arc::clone(&reader.lanes[&py].tracker);
         *feed.hook.lock().unwrap() = Some(Box::new(move || {
             tx.send(PoisonReport {
-                split: SplitId::new("overwritten").unwrap(),
-                epoch: LeaseEpoch(u64::from(py.0)),
+                partition: PartitionId(py.0),
                 kind: PoisonKind::EtagDrift,
                 reason: "overwritten".into(),
                 overwrite: Some(Box::new(Overwrite {

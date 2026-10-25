@@ -1,5 +1,5 @@
 //! The async edge: the shared listing helper and one fetcher task per
-//! gained split, reading its member objects' bytes to the pipeline thread.
+//! unit part in progress, reading its member objects' bytes to the pipeline thread.
 //!
 //! Runs on the pipeline's I/O runtime. Every channel send `await`s, so a
 //! fetcher never blocks a runtime worker and sink workers sharing the
@@ -13,12 +13,9 @@
 //!
 //! # Determinism
 //!
-//! [`ObjectStore::list`](object_store::ObjectStore::list) guarantees no
-//! ordering, so [`list_all`] collects the listing and sorts it by key
-//! before the planner packs it. A fetcher never lists: it reads its
-//! split's member objects in descriptor order, so every (ordinal, record
-//! index) offset is minted against the immutable descriptor, identical
-//! under every owner of the split.
+//! A fetcher never lists: it reads its unit's member objects in descriptor
+//! order, so every (ordinal, record index) offset is minted against the
+//! immutable descriptor, identical under every reader of the unit.
 //!
 //! # Retries
 //!
@@ -27,11 +24,11 @@
 //! ranged GET **conditioned on the object's ETag**, so a splice of two
 //! different object versions is impossible. Persistent failure (attempt
 //! budget exhausted) and the object-level non-retryable classes (missing
-//! key, failed precondition) **poison the split**, which is handed back for
-//! a peer to retry and quarantined at the attempt cap, while
+//! key, failed precondition) **poison the unit**, which is failed back to the
+//! feed for another delivery and dead-lettered at the feed's cap, while
 //! credentials/configuration failures stay fatal for the pipeline. An
 //! object whose store returns no ETag cannot be resumed mid-stream safely
-//! and poisons the split on a mid-object break instead.
+//! and poisons the unit on a mid-object break instead.
 //!
 //! A failed precondition on a notification unit that names no version, or a
 //! range the store cannot satisfy on one, is an overwrite
@@ -40,15 +37,14 @@
 //! [`SplitFailure::Overwritten`], so the reader can re-enqueue the key.
 
 use crate::error::classify;
+use crate::lane_ctx::{LaneLabel, PoisonKind};
 use crate::split::SplitRange;
-use crate::split_ctx::PoisonKind;
 use crate::trim::RangeTrim;
 use crate::unit::{Origin, quoted};
 use bytes::Bytes;
 use futures_util::StreamExt as _;
 use object_store::path::Path;
 use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt as _};
-use spate_core::coordination::SplitId;
 use spate_core::error::{ErrorClass, SourceError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -88,15 +84,15 @@ pub(crate) enum ChunkMsg {
     LaneFailed(SplitFailure),
 }
 
-/// How a split read failed. The classification decides whether one object
-/// condemns the split (poison, handled by the coordinator) or the whole
+/// How a unit read failed. The classification decides whether one object
+/// condemns the unit (poison, failed back to the feed) or the whole
 /// pipeline (fatal).
 #[derive(Debug)]
 pub(crate) enum SplitFailure {
-    /// Object-level failure: a member was deleted after planning, was
+    /// Object-level failure: a member was deleted after listing, was
     /// overwritten under its ETag pin, is corrupt, or exhausted its read
-    /// budget. The split is handed back for a peer to retry; it never
-    /// fails the pipeline directly.
+    /// budget. The unit is failed back to the feed; it never fails the
+    /// pipeline directly.
     Poison(PoisonKind, String),
     /// Instance- or configuration-level failure (credentials, permissions,
     /// client misconfiguration): terminal for the pipeline.
@@ -131,9 +127,8 @@ pub(crate) struct Overwrite {
     pub(crate) last_modified_ms: i64,
 }
 
-/// Collect and sort the full listing under `prefix`. Memory is
-/// O(number of keys), held for the duration of one plan run, which for an
-/// open plan is every replan tick, not startup alone.
+/// Collect and sort the full listing under `prefix`.
+#[cfg(test)]
 pub(crate) async fn list_all(
     store: &Arc<dyn ObjectStore>,
     prefix: Option<&Path>,
@@ -156,7 +151,7 @@ pub(crate) async fn list_all(
 /// Everything one fetcher task needs.
 pub(crate) struct FetcherParams {
     /// The split being read; names the work in failure reports and logs.
-    pub(crate) split: SplitId,
+    pub(crate) split: LaneLabel,
     pub(crate) store: Arc<dyn ObjectStore>,
     /// The split's member objects, ordinal order.
     pub(crate) slice: Arc<Vec<ObjectEntry>>,
@@ -173,19 +168,11 @@ pub(crate) struct FetcherParams {
     pub(crate) tx: mpsc::Sender<ChunkMsg>,
     /// Backpressure pause (set by `Source::pause`): checked between sends.
     pub(crate) pause: Arc<AtomicBool>,
-    /// Cooperative-revocation stop (set by `SplitCtx::begin_revoke`): checked
-    /// only at object boundaries, **never mid-object**. The
-    /// *between-objects* pause wait checks it; the mid-object pause waits
-    /// ignore it. On stop the fetcher returns, dropping `tx` at a boundary.
-    /// That channel close is indistinguishable from a natural end of slice,
-    /// so the lane takes its clean end-of-input path and never the
-    /// mid-object Fatal path (see [`run_fetcher`]).
-    pub(crate) stop: Arc<AtomicBool>,
     /// First backoff step (doubles per attempt, capped; tests shrink it).
     pub(crate) retry_base: Duration,
     /// `spate_s3_source_get_retries_total`, when metrics are attached.
     pub(crate) retries: Option<spate_core::metrics::Counter>,
-    /// The byte range of the slice's one member, for a ranged split.
+    /// The byte range of the slice's one member, for a ranged unit.
     pub(crate) range: Option<SplitRange>,
     /// `spate_s3_source_bytes_read_total`, counting the bytes a ranged read
     /// fetches and trims; the lane counts the bytes it forwards.
@@ -195,10 +182,8 @@ pub(crate) struct FetcherParams {
     pub(crate) origin: Origin,
 }
 
-/// How many attempts one object GET, and in the planner one prefix
-/// listing, gets before escalating. Failing fast (a poisoned split, a
-/// fatal plan) beats a backfill wedged invisibly in an endless retry
-/// loop.
+/// How many attempts one object GET gets before escalating. Failing fast (a
+/// poisoned unit) beats a backfill wedged invisibly in an endless retry loop.
 pub(crate) const MAX_ATTEMPTS: u32 = 8;
 pub(crate) const BACKOFF_CAP: Duration = Duration::from_secs(5);
 const PAUSE_POLL: Duration = Duration::from_millis(25);
@@ -216,7 +201,6 @@ pub(crate) async fn run_fetcher(params: FetcherParams) {
         range_bytes,
         tx,
         pause,
-        stop,
         retry_base,
         retries,
         range,
@@ -225,16 +209,8 @@ pub(crate) async fn run_fetcher(params: FetcherParams) {
     } = params;
 
     for (ordinal, entry) in slice.iter().enumerate().skip(start_ordinal as usize) {
-        // Cooperative revocation: stop only ever takes effect here, at an object
-        // boundary, before any `ObjectStart` for this object. Dropping `tx`
-        // now closes the channel exactly as a natural end of slice would, so
-        // the lane's end-of-input decision (`set_terminal` + waker) fires
-        // unmodified and the mid-object Fatal path is never reachable.
-        if stop.load(Ordering::Relaxed) {
-            return;
-        }
-        // The planner's member cap bounds split sizes, so ordinals always
-        // fit the composite-offset layout.
+        // A unit holds one member, so ordinals always fit the composite-offset
+        // layout.
         let ordinal = ordinal as u32;
         // Pin the GET to the exact content the offsets were (or will be)
         // minted against: the committed ETag for the resume object, the
@@ -244,7 +220,7 @@ pub(crate) async fn run_fetcher(params: FetcherParams) {
         } else {
             entry.etag.clone()
         };
-        if pause_gate(&pause, Some(&stop), &tx).await.is_err() {
+        if pause_gate(&pause, &tx).await.is_err() {
             return;
         }
         let started = tx
@@ -291,26 +267,9 @@ pub(crate) async fn run_fetcher(params: FetcherParams) {
 
 /// Wait while paused. Fails when the lane is gone (channel closed), so a
 /// paused fetcher still exits promptly on shutdown.
-///
-/// `stop` is passed `Some` only by the **between-objects** caller: a
-/// cooperative revocation that lands while the fetcher is back-pressured must be
-/// noticed promptly, and returning here is safe because no object is open. The
-/// mid-object callers pass `None`. A stop must never end the wait between an
-/// `ObjectStart` and its `ObjectEnd` (that would close the channel with the
-/// lane's object still open, tripping its Fatal path); mid-object they wait
-/// for unpause and let the boundary check act.
-async fn pause_gate(
-    pause: &AtomicBool,
-    stop: Option<&AtomicBool>,
-    tx: &mpsc::Sender<ChunkMsg>,
-) -> Result<(), ()> {
+async fn pause_gate(pause: &AtomicBool, tx: &mpsc::Sender<ChunkMsg>) -> Result<(), ()> {
     while pause.load(Ordering::Relaxed) {
         if tx.is_closed() {
-            return Err(());
-        }
-        if let Some(stop) = stop
-            && stop.load(Ordering::Relaxed)
-        {
             return Err(());
         }
         tokio::time::sleep(PAUSE_POLL).await;
@@ -335,7 +294,7 @@ async fn pause_gate(
     reason = "internal seam between run_fetcher and the read loops"
 )]
 async fn stream_object(
-    split: &SplitId,
+    split: &LaneLabel,
     store: &Arc<dyn ObjectStore>,
     entry: &ObjectEntry,
     pinned_etag: Option<&str>,
@@ -411,7 +370,7 @@ async fn stream_object(
     reason = "internal read loop, mirrors stream_object_streaming"
 )]
 async fn stream_object_ranged(
-    split: &SplitId,
+    split: &LaneLabel,
     store: &Arc<dyn ObjectStore>,
     entry: &ObjectEntry,
     etag: &str,
@@ -505,7 +464,7 @@ async fn stream_object_ranged(
         while !bytes.is_empty() {
             let take = bytes.len().min(chunk_bytes);
             let chunk = bytes.split_to(take);
-            if pause_gate(pause, None, tx).await.is_err() {
+            if pause_gate(pause, tx).await.is_err() {
                 return Ok(false);
             }
             if tx.send(ChunkMsg::Chunk(chunk)).await.is_err() {
@@ -531,7 +490,7 @@ async fn stream_object_ranged(
     reason = "internal read loop, mirrors stream_object_ranged"
 )]
 async fn stream_object_streaming(
-    split: &SplitId,
+    split: &LaneLabel,
     store: &Arc<dyn ObjectStore>,
     entry: &ObjectEntry,
     chunk_bytes: usize,
@@ -577,7 +536,7 @@ async fn stream_object_streaming(
                     while !bytes.is_empty() {
                         let take = bytes.len().min(chunk_bytes);
                         let chunk = bytes.split_to(take);
-                        if pause_gate(pause, None, tx).await.is_err() {
+                        if pause_gate(pause, tx).await.is_err() {
                             return Ok(false);
                         }
                         if tx.send(ChunkMsg::Chunk(chunk)).await.is_err() {
@@ -649,7 +608,7 @@ fn version_of(origin: &Origin) -> Option<String> {
 /// `pinned` (see [`is_overwrite`](crate::error::is_overwrite)), and report
 /// what the key holds now.
 ///
-/// A HEAD answering the pinned ETag poisons the split as `EtagDrift`, since
+/// A HEAD answering the pinned ETag poisons the unit as `EtagDrift`, since
 /// re-enqueueing at the same content would fail the same way. Any other
 /// answer, an absent ETag included, is [`SplitFailure::Overwritten`]. A HEAD
 /// that fails is classified as a read is: 404 poisons, 401 and 403 are
@@ -660,7 +619,7 @@ fn version_of(origin: &Origin) -> Option<String> {
     reason = "internal seam beside the read loops, which carry the same context"
 )]
 async fn head_after_overwrite(
-    split: &SplitId,
+    split: &LaneLabel,
     store: &Arc<dyn ObjectStore>,
     path: &Path,
     entry: &ObjectEntry,
@@ -730,8 +689,8 @@ async fn head_after_overwrite(
 /// `Path::from` would read the key as unencoded parts and percent-encode `%`,
 /// `#`, `[`, non-ASCII and other reserved bytes, addressing a different
 /// object. A key that is not [`addressable`](crate::listing::addressable)
-/// cannot be read, or would be read under another key, and poisons the split.
-fn object_path(split: &SplitId, entry: &ObjectEntry) -> Result<Path, SplitFailure> {
+/// cannot be read, or would be read under another key, and poisons the unit.
+fn object_path(split: &LaneLabel, entry: &ObjectEntry) -> Result<Path, SplitFailure> {
     match Path::parse(&entry.key) {
         Ok(path) if path.as_ref() == entry.key => Ok(path),
         parsed => {
@@ -759,7 +718,7 @@ fn object_path(split: &SplitId, entry: &ObjectEntry) -> Result<Path, SplitFailur
 /// deleted or overwritten object (`NotFound`, a failed `if_match`
 /// precondition), or a read that keeps failing past the attempt budget.
 async fn retry_or_fail(
-    split: &SplitId,
+    split: &LaneLabel,
     entry: &ObjectEntry,
     e: &object_store::Error,
     delivered: u64,
@@ -1116,7 +1075,7 @@ mod tests {
     ) -> Vec<ChunkMsg> {
         let (tx, mut rx) = mpsc::channel(64);
         let params = FetcherParams {
-            split: SplitId::new("s3-test").unwrap(),
+            split: "s3-test".into(),
             store,
             slice: Arc::new(slice),
             start_ordinal,
@@ -1125,7 +1084,6 @@ mod tests {
             range_bytes,
             tx,
             pause: Arc::new(AtomicBool::new(false)),
-            stop: Arc::new(AtomicBool::new(false)),
             retry_base: Duration::from_millis(1),
             retries: None,
             range: None,
@@ -1211,7 +1169,7 @@ mod tests {
         assert_eq!(got, verbatim_bodies());
     }
 
-    /// A key that is not a valid store path poisons the split as `NotFound`
+    /// A key that is not a valid store path poisons the unit as `NotFound`
     /// on both read paths, before any GET, and does not fail the pipeline.
     #[tokio::test]
     async fn an_unparseable_key_poisons_the_split() {
@@ -1234,7 +1192,7 @@ mod tests {
         }
     }
 
-    /// A key that parses to a different key poisons the split rather than
+    /// A key that parses to a different key poisons the unit rather than
     /// reading the object the parsed key names. Regression for #1116.
     #[tokio::test]
     async fn a_key_the_store_would_rewrite_poisons_the_split() {
@@ -1328,7 +1286,7 @@ mod tests {
         let slice = vec![entry("p/ghost", 1, Some("\"e\""))];
         let (tx, mut rx) = mpsc::channel(8);
         let params = FetcherParams {
-            split: SplitId::new("s3-test").unwrap(),
+            split: "s3-test".into(),
             store,
             slice: Arc::new(slice),
             start_ordinal: 0,
@@ -1337,7 +1295,6 @@ mod tests {
             range_bytes: 64,
             tx,
             pause: Arc::new(AtomicBool::new(false)),
-            stop: Arc::new(AtomicBool::new(false)),
             retry_base: Duration::from_millis(1),
             retries: None,
             range: None,
@@ -1366,7 +1323,7 @@ mod tests {
         slice[0].etag = Some("\"stale\"".into());
         let (tx, mut rx) = mpsc::channel(8);
         let params = FetcherParams {
-            split: SplitId::new("s3-test").unwrap(),
+            split: "s3-test".into(),
             store,
             slice: Arc::new(slice),
             start_ordinal: 0,
@@ -1375,7 +1332,6 @@ mod tests {
             range_bytes: 64,
             tx,
             pause: Arc::new(AtomicBool::new(false)),
-            stop: Arc::new(AtomicBool::new(false)),
             retry_base: Duration::from_millis(1),
             retries: None,
             range: None,
@@ -1403,7 +1359,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1); // tiny: sends interleave with pauses
         let pause = Arc::new(AtomicBool::new(true));
         let params = FetcherParams {
-            split: SplitId::new("s3-test").unwrap(),
+            split: "s3-test".into(),
             store,
             slice: Arc::new(slice),
             start_ordinal: 0,
@@ -1412,7 +1368,6 @@ mod tests {
             range_bytes: 64,
             tx,
             pause: Arc::clone(&pause),
-            stop: Arc::new(AtomicBool::new(false)),
             retry_base: Duration::from_millis(1),
             retries: None,
             range: None,
@@ -1444,7 +1399,7 @@ mod tests {
         let slice = listed(&store).await;
         let (tx, rx) = mpsc::channel(1);
         let params = FetcherParams {
-            split: SplitId::new("s3-test").unwrap(),
+            split: "s3-test".into(),
             store,
             slice: Arc::new(slice),
             start_ordinal: 0,
@@ -1453,7 +1408,6 @@ mod tests {
             range_bytes: 4096,
             tx,
             pause: Arc::new(AtomicBool::new(false)),
-            stop: Arc::new(AtomicBool::new(false)),
             retry_base: Duration::from_millis(1),
             retries: None,
             range: None,
@@ -1507,7 +1461,7 @@ mod tests {
         let slice = listed(&store).await;
         let (tx, _rx) = mpsc::channel(1); // ObjectStart fills the one slot; never drained
         let params = FetcherParams {
-            split: SplitId::new("s3-test").unwrap(),
+            split: "s3-test".into(),
             store: Arc::clone(&store),
             slice: Arc::new(slice),
             start_ordinal: 0,
@@ -1516,7 +1470,6 @@ mod tests {
             range_bytes: 8,
             tx,
             pause: Arc::new(AtomicBool::new(false)),
-            stop: Arc::new(AtomicBool::new(false)),
             retry_base: Duration::from_millis(1),
             retries: None,
             range: None,
@@ -1617,60 +1570,15 @@ mod tests {
         );
     }
 
-    // ----------------------------------------- cooperative-revocation stop --
-
-    #[tokio::test]
-    async fn a_preset_stop_ends_the_fetcher_before_reading_anything() {
-        // Stop set before the fetcher starts: the boundary check at the top
-        // of the loop fires before any `ObjectStart`, so `tx` is dropped with
-        // no object open. The lane reads a closed channel and takes its clean
-        // end-of-input path; a revocation at a boundary is indistinguishable
-        // from a natural end of slice.
-        let store: Arc<dyn ObjectStore> =
-            Arc::new(seeded(&[("p/a", b"aaaa"), ("p/b", b"bbbb")]).await);
-        let slice = listed(&store).await;
-        let (tx, mut rx) = mpsc::channel(64);
-        let params = FetcherParams {
-            split: SplitId::new("s3-test").unwrap(),
-            store,
-            slice: Arc::new(slice),
-            start_ordinal: 0,
-            resume_etag: None,
-            chunk_bytes: 64,
-            range_bytes: 64,
-            tx,
-            pause: Arc::new(AtomicBool::new(false)),
-            stop: Arc::new(AtomicBool::new(true)),
-            retry_base: Duration::from_millis(1),
-            retries: None,
-            range: None,
-            bytes_read: None,
-            origin: Origin::Lister,
-        };
-        let task = tokio::spawn(run_fetcher(params));
-        let mut msgs = Vec::new();
-        while let Some(m) = rx.recv().await {
-            msgs.push(m);
-        }
-        task.await.unwrap();
-        assert!(
-            msgs.is_empty(),
-            "a fetcher that starts stopped reads nothing: {msgs:?}"
-        );
-    }
-
+    /// A fetcher parked in the pause wait gives up when its lane drops the
+    /// receiver, without ever being unpaused.
     #[tokio::test(start_paused = true)]
-    async fn a_paused_fetcher_notices_the_stop_and_closes_cleanly() {
-        // A back-pressured fetcher parked in the pause wait must give up its
-        // split promptly when a revocation sets `stop`, closing the channel at
-        // the (pre-first-object) boundary rather than waiting out the pause.
+    async fn a_paused_fetcher_exits_when_its_lane_drops_the_receiver() {
         let store: Arc<dyn ObjectStore> = Arc::new(seeded(&[("p/a", b"aaaa")]).await);
         let slice = listed(&store).await;
-        let (tx, mut rx) = mpsc::channel(8);
-        let pause = Arc::new(AtomicBool::new(true));
-        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel(8);
         let params = FetcherParams {
-            split: SplitId::new("s3-test").unwrap(),
+            split: "s3-test".into(),
             store,
             slice: Arc::new(slice),
             start_ordinal: 0,
@@ -1678,8 +1586,7 @@ mod tests {
             chunk_bytes: 64,
             range_bytes: 64,
             tx,
-            pause: Arc::clone(&pause),
-            stop: Arc::clone(&stop),
+            pause: Arc::new(AtomicBool::new(true)),
             retry_base: Duration::from_millis(1),
             retries: None,
             range: None,
@@ -1687,87 +1594,13 @@ mod tests {
             origin: Origin::Lister,
         };
         let task = tokio::spawn(run_fetcher(params));
-        // Parked on the pause: nothing arrives. On paused time the sleep
-        // returns only once the fetcher is parked.
+        // On paused time the sleep returns only once the fetcher is parked.
         tokio::time::sleep(Duration::from_millis(80)).await;
-        assert!(rx.try_recv().is_err(), "a paused fetcher delivers nothing");
-        // Stop while paused: the fetcher must exit without ever unpausing. A
-        // timeout draining the channel would mean the stop was ignored.
-        stop.store(true, Ordering::Relaxed);
-        let mut msgs = Vec::new();
-        let drained = tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(m) = rx.recv().await {
-                msgs.push(m);
-            }
-        })
-        .await;
-        assert!(
-            drained.is_ok(),
-            "a paused fetcher must notice the stop promptly"
-        );
-        task.await.unwrap();
-        assert!(msgs.is_empty(), "no object was ever started: {msgs:?}");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_stop_finishes_the_open_object_then_cuts_at_the_boundary() {
-        // A stop observed mid-object must never close the channel there (that
-        // trips the lane's mid-object Fatal path): the fetcher finishes the
-        // open object and returns only at the next boundary, before starting
-        // the next object.
-        let store: Arc<dyn ObjectStore> =
-            Arc::new(seeded(&[("p/a", b"0123456789"), ("p/b", b"bbbb")]).await);
-        let slice = listed(&store).await;
-        let (tx, mut rx) = mpsc::channel(1); // interleave sends with receipts
-        let pause = Arc::new(AtomicBool::new(false));
-        let stop = Arc::new(AtomicBool::new(false));
-        let params = FetcherParams {
-            split: SplitId::new("s3-test").unwrap(),
-            store,
-            slice: Arc::new(slice),
-            start_ordinal: 0,
-            resume_etag: None,
-            chunk_bytes: 2,
-            range_bytes: 64,
-            tx,
-            pause: Arc::clone(&pause),
-            stop: Arc::clone(&stop),
-            retry_base: Duration::from_millis(1),
-            retries: None,
-            range: None,
-            bytes_read: None,
-            origin: Origin::Lister,
-        };
-        let task = tokio::spawn(run_fetcher(params));
-        // Take the first object's start and one data chunk, leaving the
-        // fetcher mid-object, then pause and stop it.
-        let m0 = rx.recv().await.unwrap();
-        assert!(matches!(m0, ChunkMsg::ObjectStart { ordinal: 0, .. }));
-        let m1 = rx.recv().await.unwrap();
-        assert!(matches!(m1, ChunkMsg::Chunk(_)), "mid the first object");
-        pause.store(true, Ordering::Relaxed);
-        stop.store(true, Ordering::Relaxed);
-        // On paused time the sleep returns only once the fetcher is parked,
-        // here mid-object with the next chunk buffered.
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        assert_eq!(rx.len(), 1, "parked mid-object behind one buffered chunk");
-        pause.store(false, Ordering::Relaxed); // let it drain to the boundary
-        let mut msgs = vec![m0, m1];
-        while let Some(m) = rx.recv().await {
-            msgs.push(m);
-        }
-        task.await.unwrap();
-        // No failure, and the first object completed intact while the second
-        // never started: the stop took effect only at the boundary.
-        assert!(
-            !msgs.iter().any(|m| matches!(m, ChunkMsg::LaneFailed(_))),
-            "a boundary stop is a clean channel close, never a failure"
-        );
-        assert_eq!(
-            assembled(&msgs),
-            vec![("p/a".to_string(), b"0123456789".to_vec())],
-            "the open object finishes; the boundary stop precedes the next object"
-        );
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("a paused fetcher exits once the receiver is gone")
+            .unwrap();
     }
 
     /// A read the store refuses with a TLS alert fails the lane as
@@ -1841,7 +1674,7 @@ mod tests {
         assert_cut(&reason);
     }
 
-    /// A read answered 404 with a 64 KiB body poisons the split as
+    /// A read answered 404 with a 64 KiB body poisons the unit as
     /// `NotFound`, with the store's text cut to the bound.
     #[tokio::test]
     async fn a_missing_object_with_a_large_body_poisons_and_cut() {
@@ -1917,7 +1750,7 @@ mod tests {
         assert!(e.to_string().contains("HandshakeFailure"), "{e}");
     }
 
-    /// A read failing past its attempt budget poisons the split with the
+    /// A read failing past its attempt budget poisons the unit with the
     /// last error's text cut to the bound.
     #[tokio::test(start_paused = true)]
     async fn a_read_failing_past_the_budget_with_a_large_error_is_cut() {
@@ -2080,8 +1913,8 @@ mod tests {
         plan: ReadPlan,
     ) -> Vec<(i64, Vec<u8>)> {
         use crate::lane::S3Lane;
+        use crate::lane_ctx::SplitTracker;
         use crate::offset::Position;
-        use crate::split_ctx::SplitTracker;
         use spate_core::source::{PayloadBatch as _, SourceLane as _};
 
         let flaky = FlakyStore {
@@ -2100,7 +1933,7 @@ mod tests {
         let slice = rt.block_on(listed(&store));
         let (tx, rx) = mpsc::channel(4);
         rt.spawn(run_fetcher(FetcherParams {
-            split: SplitId::new("s3-test").unwrap(),
+            split: "s3-test".into(),
             store,
             slice: Arc::new(slice),
             start_ordinal: 0,
@@ -2109,7 +1942,6 @@ mod tests {
             range_bytes: plan.range_bytes,
             tx,
             pause: Arc::new(AtomicBool::new(false)),
-            stop: Arc::new(AtomicBool::new(false)),
             retry_base: Duration::from_millis(1),
             retries: None,
             range,
@@ -2130,11 +1962,9 @@ mod tests {
                 ordinal: 0,
                 record: resume,
             }),
-            SplitId::new("s3-test").unwrap(),
-            spate_core::coordination::LeaseEpoch(1),
             Arc::clone(&tracker),
             poison_tx,
-            spate_core::coordination::ControlWaker::inert(),
+            spate_core::feed::wake_channel().0,
             None,
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -2312,7 +2142,7 @@ mod tests {
         let trimmed = Arc::new(AtomicU64::new(0));
         let (tx, mut rx) = mpsc::channel(64);
         let task = tokio::spawn(run_fetcher(FetcherParams {
-            split: SplitId::new("s3-test").unwrap(),
+            split: "s3-test".into(),
             store,
             slice: Arc::new(slice),
             start_ordinal: 0,
@@ -2321,7 +2151,6 @@ mod tests {
             range_bytes: 4,
             tx,
             pause: Arc::new(AtomicBool::new(false)),
-            stop: Arc::new(AtomicBool::new(false)),
             retry_base: Duration::from_millis(1),
             retries: None,
             range: Some(SplitRange::new(8, 21, b'\n')),
@@ -2537,7 +2366,7 @@ mod tests {
     ) -> Vec<ChunkMsg> {
         let (tx, mut rx) = mpsc::channel(64);
         let task = tokio::spawn(run_fetcher(FetcherParams {
-            split: SplitId::new("s3-test").unwrap(),
+            split: "s3-test".into(),
             store,
             slice: Arc::new(vec![entry]),
             start_ordinal: 0,
@@ -2546,7 +2375,6 @@ mod tests {
             range_bytes: 10,
             tx,
             pause: Arc::new(AtomicBool::new(false)),
-            stop: Arc::new(AtomicBool::new(false)),
             retry_base: Duration::from_millis(1),
             retries,
             range: None,
@@ -2682,7 +2510,7 @@ mod tests {
     }
 
     /// Pins that a failed precondition on a lister's unit or on a read that
-    /// names a version poisons the split as `EtagDrift` without a HEAD.
+    /// names a version poisons the unit as `EtagDrift` without a HEAD.
     #[tokio::test]
     async fn a_412_on_a_lister_or_versioned_read_poisons_without_a_head() {
         for origin in [Origin::Lister, notified(Some("v1"))] {
@@ -2843,7 +2671,7 @@ mod tests {
 
     /// Pins that a transient HEAD failure after a 412 is retried and counted
     /// in `get_retries`, and that a HEAD failing past the attempt budget
-    /// poisons the split as `RetriesExhausted`.
+    /// poisons the unit as `RetriesExhausted`.
     #[tokio::test(start_paused = true)]
     async fn a_retryable_head_after_a_412_is_retried() {
         let transient = || object_store::Error::Generic {

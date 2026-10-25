@@ -141,7 +141,6 @@ pub(crate) fn is_manifest(path: &str) -> bool {
             "Cargo.lock",
             "crates/*/Cargo.toml",
             "bench/Cargo.toml",
-            "faults/Cargo.toml",
             "fuzz/Cargo.toml",
             "test-support/Cargo.toml",
             "xtask/Cargo.toml",
@@ -235,16 +234,14 @@ pub(crate) fn classify(
                 image_suites.extend(graph.container_suites_for("spate-kafka"));
                 out.container_pkgs.extend(image_suites.iter().cloned());
             }
-            // The server the NATS suites run against. `spate` boots it only in
-            // its examples tier, which the container suites leave out.
+            // The server the NATS suites run against.
             if glob(path, "ci/nats/*") {
-                image_suites.extend(["spate-coordination", "spate-s3"].map(String::from));
+                image_suites.extend(["spate-coordination"].map(String::from));
                 out.container_pkgs.extend(image_suites.iter().cloned());
             }
             // The S3 store the spate-s3 suites run against, and the queue the
             // shared helpers start. The Kafka feed's notification suite boots
-            // it beside the broker, and the fault runs boot it too, outside
-            // the container suites.
+            // it beside the broker.
             if glob(path, "ci/rustfs/*") {
                 image_suites
                     .extend(["spate-kafka", "spate-s3", "spate-test-support"].map(String::from));
@@ -718,11 +715,6 @@ mod tests {
     }
 
     #[test]
-    fn the_faults_manifest_is_a_manifest() {
-        assert!(run(&["faults/Cargo.toml"]).manifests);
-    }
-
-    #[test]
     fn a_fuzz_dependency_builds_the_harness() {
         assert!(run(&["crates/spate-core/src/lib.rs"]).fuzz);
         assert!(!run(&["crates/spate-test/src/lib.rs"]).fuzz);
@@ -828,17 +820,14 @@ mod tests {
     fn a_nats_image_bump_selects_the_suites_that_boot_nats() {
         for lane in ["floor", "below-floor"] {
             let image = vec![format!("ci/nats/{lane}/Dockerfile")];
-            assert_eq!(
-                suites(&run(&[image[0].as_str()])),
-                ["spate-coordination", "spate-s3"]
-            );
+            assert_eq!(suites(&run(&[image[0].as_str()])), ["spate-coordination"]);
 
             let ctx = Context {
                 author: "dependabot[bot]".into(),
                 labels: vec![],
             };
             let out = classify(&image, Event::PullRequest, &ctx, &graph(), &[]);
-            assert_eq!(suites(&out), ["spate-coordination", "spate-s3"]);
+            assert_eq!(suites(&out), ["spate-coordination"]);
         }
     }
 
@@ -1000,7 +989,6 @@ mod tests {
             "Cargo.lock",
             "crates/spate-s3/Cargo.toml",
             "bench/Cargo.toml",
-            "faults/Cargo.toml",
             "fuzz/Cargo.toml",
             "test-support/Cargo.toml",
             "xtask/Cargo.toml",
@@ -1014,7 +1002,6 @@ mod tests {
         }
         for path in [
             "bench/src/lib.rs",
-            "faults/src/lib.rs",
             "test-support/src/lib.rs",
             ".github/workflows/scheduled.yml",
             ".github/workflows/site.yml",

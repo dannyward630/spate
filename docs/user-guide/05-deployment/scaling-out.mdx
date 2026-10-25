@@ -19,9 +19,8 @@ depends on the source:
 :::note Connector specifics
 Which kind each shipped source is, and how to wire it:
 [Kafka source](../04-connectors/sources/kafka/README.mdx) (brokered) ·
-[S3 source](../04-connectors/sources/s3/README.mdx#scaling-out-and-the-solo-default)
-(coordinated, or
-[feed-reading](../04-connectors/sources/s3/README.mdx#reading-from-a-feed)) ·
+[S3 source](../04-connectors/sources/s3/README.mdx#scaling-out)
+(feed-reading) ·
 [Datagen source](../04-connectors/sources/datagen/README.mdx#delivery-semantics)
 (neither, since every replica generates its own stream from offset 0).
 :::
