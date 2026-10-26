@@ -28,7 +28,7 @@ pub(crate) struct Context {
 /// `default` labels the unmodified build. It is not a cargo feature name:
 /// packages need not declare a `default` key, and cargo rejects
 /// `--features default` when absent.
-fn feature_arms_for(pkg: &str) -> Vec<(&'static str, &'static str)> {
+pub(crate) fn feature_arms_for(pkg: &str) -> Vec<(&'static str, &'static str)> {
     match pkg {
         // `simd` replaces the byte-slice-to-value decoder behind the backend
         // seam: one set of benches over two implementations.
@@ -1112,6 +1112,18 @@ mod tests {
         ] {
             let rendered = run(&[path]).to_string();
             assert!(rendered.lines().any(|l| l == line), "{path}: {rendered}");
+        }
+    }
+
+    /// A committed snapshot file and the toolchain it was taken with each
+    /// select the Rust jobs, which carry the snapshot job.
+    #[test]
+    fn a_snapshot_file_selects_rust() {
+        for path in [
+            "crates/spate-json/benches/alloc/decode_alloc.default.x86_64.tsv",
+            ".github/toolchains/stable/rust-toolchain.toml",
+        ] {
+            assert!(run(&[path]).rust, "{path}");
         }
     }
 
