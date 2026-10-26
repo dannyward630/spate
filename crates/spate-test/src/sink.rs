@@ -25,7 +25,7 @@ pub struct ReplicaTag {
     pub replica: usize,
 }
 
-/// How a scripted write resolves.
+/// How a scripted write resolves, or that it has not yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ScriptedResult {
@@ -35,6 +35,9 @@ pub enum ScriptedResult {
     Retryable(String),
     /// The write fails with [`ErrorClass::Fatal`].
     Fatal(String),
+    /// The write has not resolved: it is held, in its delay, or its future
+    /// was dropped before it resolved. Never a scripted outcome.
+    Pending,
 }
 
 /// One scripted write outcome: an optional hold, an optional delay, then a
@@ -119,7 +122,8 @@ pub struct CapturedWrite {
     /// All frames concatenated (decode with [`decode_rows`](crate::decode_rows)
     /// when produced by [`TestEncoder`]).
     pub payload: Vec<u8>,
-    /// How the scripted attempt resolved.
+    /// How the attempt resolved, or [`Pending`](ScriptedResult::Pending)
+    /// until it does.
     pub result: ScriptedResult,
 }
 
@@ -150,6 +154,15 @@ impl Drop for Holding {
     }
 }
 
+/// Refuse an outcome scripted to resolve as `Pending`, at the test's own
+/// call rather than inside a pipeline's sink task.
+fn refuse_pending(outcome: &WriteOutcome) {
+    assert!(
+        outcome.result != ScriptedResult::Pending,
+        "a write cannot be scripted to resolve as Pending; script it with WriteOutcome::held()"
+    );
+}
+
 /// Build a paired scriptable writer and its handle.
 #[must_use]
 pub fn capture_writer() -> (CaptureWriter, SinkScript) {
@@ -176,12 +189,22 @@ impl SinkScript {
 
     /// Queue an outcome consumed by the next otherwise-unscripted write to
     /// **any** endpoint (FIFO). Endpoint-specific scripts take precedence.
+    ///
+    /// # Panics
+    ///
+    /// If `outcome.result` is [`Pending`](ScriptedResult::Pending).
     pub fn enqueue_global(&self, outcome: WriteOutcome) {
+        refuse_pending(&outcome);
         self.lock().global.push_back(outcome);
     }
 
     /// Queue an outcome for the next write to `(shard, replica)` (FIFO).
+    ///
+    /// # Panics
+    ///
+    /// If `outcome.result` is [`Pending`](ScriptedResult::Pending).
     pub fn enqueue_for(&self, shard: usize, replica: usize, outcome: WriteOutcome) {
+        refuse_pending(&outcome);
         self.lock()
             .per_endpoint
             .entry((shard, replica))
@@ -202,7 +225,10 @@ impl SinkScript {
         self.lock().probe_failures.remove(&(shard, replica));
     }
 
-    /// Every write attempt so far, in order.
+    /// Every write attempt so far, in the order they started.
+    ///
+    /// An attempt reads [`Pending`](ScriptedResult::Pending) until its write
+    /// resolves.
     #[must_use]
     pub fn writes(&self) -> Vec<CapturedWrite> {
         self.lock().writes.clone()
@@ -266,7 +292,7 @@ impl ShardWriter for CaptureWriter {
             .flat_map(|f: &Bytes| f.iter().copied())
             .collect();
         async move {
-            let (outcome, hold) = {
+            let (outcome, hold, at) = {
                 let mut st = state.lock().expect("spate-test sink state poisoned");
                 let outcome = st
                     .per_endpoint
@@ -274,6 +300,7 @@ impl ShardWriter for CaptureWriter {
                     .and_then(VecDeque::pop_front)
                     .or_else(|| st.global.pop_front())
                     .unwrap_or_else(WriteOutcome::ok);
+                let at = st.writes.len();
                 st.writes.push(CapturedWrite {
                     shard: endpoint.shard,
                     replica: endpoint.replica,
@@ -281,7 +308,7 @@ impl ShardWriter for CaptureWriter {
                     bytes,
                     dedup_token,
                     payload,
-                    result: outcome.result.clone(),
+                    result: ScriptedResult::Pending,
                 });
                 // Read under the lock that recorded the write, so a release
                 // that follows a test's read of `writes()` reaches this one.
@@ -289,7 +316,7 @@ impl ShardWriter for CaptureWriter {
                     st.holding += 1;
                     (st.releases, Holding(Arc::clone(&state)))
                 });
-                (outcome, hold)
+                (outcome, hold, at)
             };
             if let Some((started_at, _holding)) = hold {
                 std::future::poll_fn(|cx| {
@@ -306,17 +333,26 @@ impl ShardWriter for CaptureWriter {
             if let Some(delay) = outcome.delay {
                 tokio::time::sleep(delay).await;
             }
-            match outcome.result {
+            let resolved = match &outcome.result {
                 ScriptedResult::Ok => Ok(()),
                 ScriptedResult::Retryable(reason) => Err(SinkError::Client {
                     class: ErrorClass::Retryable,
-                    reason,
+                    reason: reason.clone(),
                 }),
                 ScriptedResult::Fatal(reason) => Err(SinkError::Client {
                     class: ErrorClass::Fatal,
-                    reason,
+                    reason: reason.clone(),
                 }),
-            }
+                ScriptedResult::Pending => {
+                    unreachable!("the enqueue methods refuse a Pending outcome")
+                }
+            };
+            // Recorded before the future returns, so a test that reads
+            // `writes()` after anything the return causes sees the result.
+            // `writes` only grows, so `at` still names this attempt.
+            state.lock().expect("spate-test sink state poisoned").writes[at].result =
+                outcome.result;
+            resolved
         }
     }
 
