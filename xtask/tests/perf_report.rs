@@ -26,9 +26,9 @@ Advisory: numbers never block a merge; a bench that stops running does.
 A **bold** delta crossed a provisional threshold and syncs the
 `affects-performance` label; nothing else happens.
 
-| Shard | Bench | PR | baseline | Δ |
-| --- | --- | ---: | ---: | ---: |
-| spate-json | decode::decode_value flat_record | 107000 | 100000 | **+7%** (over threshold) |
+| Shard | Arch | Bench | PR | baseline | Δ |
+| --- | --- | --- | ---: | ---: | ---: |
+| spate-json |  | decode::decode_value flat_record | 107000 | 100000 | **+7%** (over threshold) |
 
 <details><summary>All metrics</summary>
 
@@ -156,7 +156,7 @@ fn a_run_that_crossed_no_threshold_writes_false() {
             .lines()
             .filter(|l| l.starts_with("| spate-json |"))
             .collect::<Vec<_>>(),
-        ["| spate-json | decode::decode_value flat_record | 100000 | 99000 | +1% |"]
+        ["| spate-json |  | decode::decode_value flat_record | 100000 | 99000 | +1% |"]
     );
     assert_eq!(scratch.flag_body().as_deref(), Some("false\n"));
 }
@@ -185,7 +185,7 @@ fn the_baseline_label_names_the_old_column() {
                 .lines()
                 .filter(|l| l.starts_with("| Shard |"))
                 .collect::<Vec<_>>(),
-            [format!("| Shard | Bench | PR | {header} | Δ |")],
+            [format!("| Shard | Arch | Bench | PR | {header} | Δ |")],
             "{label:?}"
         );
     }
@@ -449,4 +449,92 @@ fn the_flag_file_matches_an_arm_the_label_workflow_acts_on() {
         assert_eq!(stripped, want);
         assert!(arms.contains(&stripped.as_str()), "{stripped}");
     }
+}
+
+/// The stamp `perf.yml` writes carries every key the report reads from
+/// `spate_shard`, the architecture included.
+#[test]
+fn the_stamp_perf_yml_writes_names_every_key_the_report_reads() {
+    let workflow = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join(".github/workflows/perf.yml"),
+    )
+    .unwrap();
+    let (_, rest) = workflow
+        .split_once("spate_shard: {")
+        .expect("perf.yml stamps a spate_shard object");
+    let (object, _) = rest.split_once('}').unwrap();
+    let keys: Vec<&str> = object
+        .split(',')
+        .map(|field| field.split_once(':').unwrap().0.trim())
+        .collect();
+    assert_eq!(keys, ["package", "features", "baseline", "rustc", "arch"]);
+}
+
+/// The stamp step writes the matrix leg's own architecture, arm and package
+/// into `spate_shard`.
+#[test]
+fn the_stamp_step_writes_the_legs_architecture() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let text = std::fs::read_to_string(root.join(".github/workflows/perf.yml")).unwrap();
+    let wf: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let step = wf["jobs"]["perf-counters"]["steps"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"].as_str() == Some("Stamp this shard's summaries"))
+        .expect("the stamp step");
+    let context = [
+        ("matrix.package", "spate-json"),
+        ("matrix.arm", "simd"),
+        ("matrix.arch", "aarch64"),
+        ("steps.base.outputs.measured", "true"),
+        ("steps.base.outputs.merge-base", "0123456789abcdef"),
+        ("steps.rust.outputs.rustc", "rustc 1.0"),
+    ];
+    let expand = |v: &str| -> String {
+        let mut out = v.to_owned();
+        while let Some(start) = out.find("${{") {
+            let end = start + out[start..].find("}}").unwrap() + 2;
+            let expr = out[start + 3..end - 2].trim();
+            let val = context
+                .iter()
+                .find(|(k, _)| *k == expr)
+                .unwrap_or_else(|| panic!("unknown expression {expr}"))
+                .1;
+            out.replace_range(start..end, val);
+        }
+        out
+    };
+    let dir =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("the_stamp_step_writes_the_legs_architecture");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("target/gungraun/b")).unwrap();
+    std::fs::write(
+        dir.join("target/gungraun/b/summary.json"),
+        "{\"version\":\"7\"}\n",
+    )
+    .unwrap();
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(step["run"].as_str().unwrap())
+        .current_dir(&dir);
+    for (k, v) in step["env"].as_mapping().unwrap() {
+        cmd.env(k.as_str().unwrap(), expand(v.as_str().unwrap()));
+    }
+    let out = cmd.output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let line = std::fs::read_to_string(dir.join("shard/spate-json.simd.jsonl")).unwrap();
+    let got: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    let shard = &got["spate_shard"];
+    assert_eq!(shard["package"], "spate-json", "{line}");
+    assert_eq!(shard["features"], "simd", "{line}");
+    assert_eq!(shard["arch"], "aarch64", "{line}");
 }

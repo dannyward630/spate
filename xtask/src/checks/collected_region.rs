@@ -34,14 +34,14 @@ const MIN_APPLICATION_PCT: i64 = 10;
 /// The second signal. A lost region can also leave almost nothing: a handful of
 /// instructions belonging to the toggled wrapper. That is application code, and
 /// the composition rule passes it. The floor is 1,000 against a smallest real
-/// case of 6,656.
+/// case of 6,919 on x86_64 and 6,139 on aarch64.
 const MIN_COLLECTED_IR: i64 = 1000;
 
 /// Judges every case under `dir`, defaulting to the tree the benches write to.
 ///
-/// `shard` prefixes every line with the (package, arm) being measured. A
-/// relative `dir` resolves against the repository root, and the paths the
-/// diagnostics name are built from it as given.
+/// `shard` prefixes every line with the (package, arm, architecture) being
+/// measured. A relative `dir` resolves against the repository root, and the
+/// paths the diagnostics name are built from it as given.
 pub(crate) fn check(root: &Path, explain: bool, shard: Option<&str>, dir: Option<&str>) -> Outcome {
     let dir = dir.map_or_else(default_dir, |d| d.trim_end_matches('/').to_owned());
     if explain {
