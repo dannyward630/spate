@@ -3841,6 +3841,75 @@ fn a_stop_during_a_blocked_revocation_drains_at_once() {
     assert_revoked_while_blocked(&h.shared);
 }
 
+/// Pins that while a revocation waits on a driver held by a blocked batch,
+/// the controller lets the source renew what it holds on more than one pass.
+/// Regression for #1278.
+#[test]
+fn a_revocation_waiting_on_its_drain_lets_the_source_renew() {
+    let clock = crate::clock::TestClock::frozen();
+    let h = start_stopping(
+        stop_config(Duration::from_secs(600)),
+        false,
+        &clock,
+        |_| None,
+        blocked_chain,
+    );
+    revoke_a_blocked_lane(&h);
+    wait_for(
+        "the source renews during the wait",
+        Duration::from_secs(5),
+        || h.shared.lock().unwrap().renew_held_calls >= 2,
+    );
+    h.shutdown.trigger();
+    joined(&h);
+    assert_eq!(h.join.join().unwrap().unwrap().state, ExitState::Completed);
+    assert_revoked_while_blocked(&h.shared);
+}
+
+/// Pins that a revocation waiting on its drain during a stop's read phase
+/// lets the source renew on each pass, the passes counted by the
+/// `reading_on_stop` the same wait asks on each one.
+#[test]
+fn a_revocation_during_the_read_phase_renews_on_each_pass() {
+    let drain_timeout = Duration::from_secs(600);
+    let clock = crate::clock::TestClock::frozen();
+    let h = start_stopping(
+        stop_config(drain_timeout),
+        true,
+        &clock,
+        |_| None,
+        blocked_chain,
+    );
+    h.shutdown.trigger();
+    wait_for("the read phase", Duration::from_secs(5), || {
+        h.shared.lock().unwrap().reading_on_stop_calls > 0
+    });
+    revoke_a_blocked_lane(&h);
+    let (asked, renewed) = {
+        let log = h.shared.lock().unwrap();
+        (log.reading_on_stop_calls, log.renew_held_calls)
+    };
+    wait_for("five passes of the wait", Duration::from_secs(5), || {
+        h.shared.lock().unwrap().reading_on_stop_calls >= asked + 5
+    });
+    let (passes, renews) = {
+        let log = h.shared.lock().unwrap();
+        (
+            log.reading_on_stop_calls - asked,
+            log.renew_held_calls - renewed,
+        )
+    };
+    // One `reading_on_stop` may precede the wait's first pass.
+    assert!(
+        renews + 1 >= passes,
+        "{renews} renewals over {passes} passes"
+    );
+    clock.advance(drain_timeout - crate::feed::STOP_RESERVE);
+    joined(&h);
+    assert_eq!(h.join.join().unwrap().unwrap().state, ExitState::Completed);
+    assert_revoked_while_blocked(&h.shared);
+}
+
 /// The lane's batch blocked and its revocation reached the controller.
 fn assert_revoked_while_blocked(shared: &SharedLog) {
     let log = shared.lock().unwrap();
