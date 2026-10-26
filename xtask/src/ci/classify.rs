@@ -22,7 +22,6 @@ pub(crate) enum Event {
 #[derive(Debug, Default)]
 pub(crate) struct Context {
     pub(crate) author: String,
-    pub(crate) labels: Vec<String>,
 }
 
 /// `default` labels the unmodified build. It is not a cargo feature name:
@@ -370,10 +369,13 @@ pub(crate) fn classify(
             // The measuring apparatus: a change to what is discovered, which
             // crates are chosen, or how results are read alters every crate's
             // outcome. Without this, the change rewriting bench selection is
-            // the one that never runs them.
+            // the one that never runs them. The root manifest holds the build
+            // profiles and the workspace pins that every crate's codegen
+            // follows.
             if any_glob(
                 path,
                 &[
+                    "Cargo.toml",
                     "xtask/*",
                     ".github/workflows/ci.yml",
                     ".github/workflows/perf.yml",
@@ -411,7 +413,6 @@ pub(crate) fn classify(
     }
 
     apply_deferrals(&mut out, event, ctx, &image_suites);
-    apply_labels(&mut out, &mut bench_pkgs, ctx, graph);
 
     out.bench_shards = bench_pkgs
         .iter()
@@ -473,29 +474,6 @@ fn apply_deferrals(
             out.semver_pkgs.clear();
         }
         _ => {}
-    }
-}
-
-/// `ci: docker` and `ci: bench` force a suite on for a change whose paths would
-/// not have selected it. They can only add: an override able to clear a
-/// selection would make the classifier fail open.
-///
-/// Applied after the deferrals, so labelling a bot's pull request overrides one
-/// for that one bump.
-fn apply_labels(
-    out: &mut Outputs,
-    bench_pkgs: &mut BTreeSet<String>,
-    ctx: &Context,
-    graph: &Graph,
-) {
-    let has = |name: &str| ctx.labels.iter().any(|l| l == name);
-    if has("ci: docker") {
-        out.container_pkgs
-            .extend(graph.all_container_pkgs().iter().cloned());
-    }
-    if has("ci: bench") {
-        out.bench = true;
-        bench_pkgs.extend(graph.all_bench_pkgs().iter().cloned());
     }
 }
 
@@ -633,7 +611,7 @@ mod tests {
 
     #[test]
     fn an_unbenched_crate_runs_no_shards() {
-        let out = run(&["crates/spate-test/src/lib.rs"]);
+        let out = run(&["crates/spate-sqs/src/lib.rs"]);
         assert!(!out.bench);
         assert!(
             out.bench_shards.is_empty(),
@@ -651,6 +629,45 @@ mod tests {
                 .map(|s| s.package.as_str())
                 .collect::<Vec<_>>(),
             ["spate-kafka"]
+        );
+    }
+
+    /// A change to the core is measured wherever a bench exists.
+    #[test]
+    fn a_core_change_selects_every_bench() {
+        let out = run(&["crates/spate-core/src/lib.rs"]);
+        assert!(out.bench);
+        assert_eq!(out.bench_shards.len(), graph().all_bench_pkgs().len() + 1);
+    }
+
+    /// A change to a crate selects the benched crates that depend on it, over
+    /// normal and dev edges.
+    #[test]
+    fn a_dependency_of_a_benched_crate_selects_its_benches() {
+        let pkgs = |path| {
+            run(&[path])
+                .bench_shards
+                .iter()
+                .map(|s| s.package.clone())
+                .collect::<BTreeSet<_>>()
+        };
+        assert!(pkgs("crates/spate-json/src/lib.rs").contains("spate-s3"));
+        assert_eq!(
+            pkgs("crates/spate-clickhouse-derive/src/lib.rs"),
+            BTreeSet::from(["spate-clickhouse".to_string()])
+        );
+        assert_eq!(
+            pkgs("crates/spate-test/src/lib.rs"),
+            BTreeSet::from(
+                [
+                    "spate-avro",
+                    "spate-clickhouse",
+                    "spate-json",
+                    "spate-kafka",
+                    "spate-s3"
+                ]
+                .map(String::from)
+            )
         );
     }
 
@@ -692,7 +709,11 @@ mod tests {
     #[test]
     fn the_second_arm_gets_its_own_shard() {
         let shards = run(&["crates/spate-json/src/lib.rs"]).bench_shards;
-        let arms: Vec<&str> = shards.iter().map(|s| s.arm.as_str()).collect();
+        let arms: Vec<&str> = shards
+            .iter()
+            .filter(|s| s.package == "spate-json")
+            .map(|s| s.arm.as_str())
+            .collect();
         assert_eq!(arms, ["default", "simd"]);
     }
 
@@ -720,6 +741,32 @@ mod tests {
             );
         }
         assert!(!run(&[".github/workflows/site.yml"]).bench);
+    }
+
+    /// The root manifest selects every bench; a lockfile, a policy file or a
+    /// page selects none. A bot's manifest bump keeps its benches while its
+    /// container suites are deferred.
+    #[test]
+    fn a_manifest_change_selects_every_bench() {
+        let out = run(&["Cargo.toml"]);
+        assert!(out.bench);
+        assert_eq!(out.bench_shards.len(), graph().all_bench_pkgs().len() + 1);
+        for path in [
+            "Cargo.lock",
+            "deny.toml",
+            ".github/workflows/site.yml",
+            "docs/a.md",
+        ] {
+            assert!(!run(&[path]).bench, "{path}");
+        }
+
+        let ctx = Context {
+            author: "dependabot[bot]".into(),
+        };
+        let bump = vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()];
+        let out = classify(&bump, Event::PullRequest, &ctx, &graph(), &[]);
+        assert!(out.bench);
+        assert!(out.container_pkgs.is_empty());
     }
 
     /// The semver gate's workflows reach every published API; another unit
@@ -784,26 +831,23 @@ mod tests {
         );
     }
 
+    /// A dependency or cargo configuration change selects every container
+    /// suite, which is the route a dependency swap takes.
     #[test]
-    fn labels_only_add() {
-        let ctx = Context {
-            author: String::new(),
-            labels: vec!["ci: docker".into()],
-        };
-        let paths = vec!["docs/a.md".to_string()];
-        let out = classify(&paths, Event::PullRequest, &ctx, &graph(), &[]);
-        assert_eq!(out.container_pkgs, *graph().all_container_pkgs());
-        assert!(
-            !out.rust,
-            "an override cannot clear the path-derived baseline"
-        );
+    fn a_dependency_change_selects_every_suite() {
+        for path in ["Cargo.lock", "Cargo.toml", ".cargo/config.toml"] {
+            assert_eq!(
+                run(&[path]).container_pkgs,
+                *graph().all_container_pkgs(),
+                "{path}"
+            );
+        }
     }
 
     #[test]
     fn dependabot_defers_the_suites_but_not_an_image_bump() {
         let ctx = Context {
             author: "dependabot[bot]".into(),
-            labels: vec![],
         };
         let lock = vec!["Cargo.lock".to_string()];
         assert!(
@@ -828,7 +872,6 @@ mod tests {
 
         let ctx = Context {
             author: "dependabot[bot]".into(),
-            labels: vec![],
         };
         let image = vec!["ci/debian/trixie/Dockerfile".to_string()];
         let out = classify(&image, Event::PullRequest, &ctx, &graph(), &[]);
@@ -846,7 +889,6 @@ mod tests {
 
         let ctx = Context {
             author: "dependabot[bot]".into(),
-            labels: vec![],
         };
         let image = vec!["ci/rust/stable/Dockerfile".to_string()];
         let out = classify(&image, Event::PullRequest, &ctx, &graph(), &[]);
@@ -871,7 +913,6 @@ mod tests {
 
         let ctx = Context {
             author: "dependabot[bot]".into(),
-            labels: vec![],
         };
         let image = vec!["ci/kafka/stable/Dockerfile".to_string()];
         let out = classify(&image, Event::PullRequest, &ctx, &graph(), &[]);
@@ -885,7 +926,6 @@ mod tests {
     fn a_test_store_image_bump_selects_the_suites_that_boot_it() {
         let ctx = Context {
             author: "dependabot[bot]".into(),
-            labels: vec![],
         };
         for (image, expected) in [
             (
@@ -908,7 +948,6 @@ mod tests {
     fn the_release_pull_request_defers_the_semver_gate_too() {
         let ctx = Context {
             author: "spate-release[bot]".into(),
-            labels: vec![],
         };
         let paths = vec!["Cargo.lock".to_string()];
         let out = classify(&paths, Event::PullRequest, &ctx, &graph(), &[]);
@@ -920,7 +959,6 @@ mod tests {
     fn a_deferral_applies_to_pull_requests_alone() {
         let ctx = Context {
             author: "dependabot[bot]".into(),
-            labels: vec![],
         };
         let paths = vec!["Cargo.lock".to_string()];
         let out = classify(&paths, Event::MergeGroup, &ctx, &graph(), &[]);
@@ -1005,7 +1043,6 @@ mod tests {
     fn a_bot_lock_bump_runs_the_macos_lane() {
         let ctx = Context {
             author: "dependabot[bot]".into(),
-            labels: vec![],
         };
         let paths = vec!["Cargo.lock".to_string()];
         let out = classify(&paths, Event::PullRequest, &ctx, &graph(), &[]);
@@ -1093,7 +1130,6 @@ mod tests {
     fn a_dependabot_tool_bump_keeps_the_release_rehearsal() {
         let ctx = Context {
             author: "dependabot[bot]".into(),
-            labels: vec![],
         };
         let paths = vec![".github/actions/setup-rust/action.yml".to_string()];
         let out = classify(&paths, Event::PullRequest, &ctx, &graph(), &[]);
