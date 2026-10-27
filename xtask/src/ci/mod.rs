@@ -19,7 +19,7 @@ use crate::repo_root;
 pub(crate) fn changes(args: &[String]) -> Result<(), String> {
     let root = repo_root()?;
     let graph = graph::Graph::load(&root)?;
-    let lanes = extra_clickhouse_lanes(&root)?;
+    let lanes = extra_lanes(&root)?;
     let (ev, ctx) = event::from_environment();
 
     // An argument, so no exported variable can turn a real classification
@@ -94,15 +94,68 @@ pub(crate) fn merge_base(root: &Path, base: &str) -> Option<String> {
     event::GitDiff::new(root, classify::Event::PullRequest).merge_base(base, "HEAD")
 }
 
-/// The ClickHouse lanes needing a job beyond the primary one. The lane names
-/// live in the repository's `ci/clickhouse/`, so adding or repointing one
+/// The ClickHouse server lanes and S3 store lanes needing a job beyond the
+/// primary one, each S3 lane with its store's capabilities. The lanes live in
+/// the repository's `ci/clickhouse/` and `ci/s3/`, so adding or repointing one
 /// needs no edit here.
-fn extra_clickhouse_lanes(root: &Path) -> Result<Vec<String>, String> {
-    container_image::extra_lanes(root, "clickhouse").map_err(|e| e.message)
+fn extra_lanes(root: &Path) -> Result<classify::ExtraLanes, String> {
+    let clickhouse = container_image::extra_lanes(root, "clickhouse").map_err(|e| e.message)?;
+    let s3 = container_image::extra_lanes(root, "s3")
+        .map_err(|e| e.message)?
+        .iter()
+        .map(|lane| {
+            container_image::lane_capabilities(root, "s3", lane)
+                .map(|caps| outputs::StoreLane::new(lane, &caps))
+                .map_err(|e| e.message)
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(classify::ExtraLanes { clickhouse, s3 })
 }
 
 #[cfg(test)]
 mod tests {
+    /// Each extra S3 lane carries its own capabilities into its filter, and
+    /// the extra ClickHouse lanes come through beside them.
+    #[test]
+    fn extra_lanes_reads_each_s3_lane_with_its_capabilities() {
+        use super::outputs::StoreLane;
+        use crate::checks::container_image::Capability;
+
+        let root =
+            std::env::temp_dir().join(format!("spate-xtask-extra-lanes-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&root));
+        let pin = |service: &str, lane: &str, tag: &str| {
+            let dir = root.join("ci").join(service).join(lane);
+            std::fs::create_dir_all(&dir).unwrap();
+            let digest = "a".repeat(64);
+            std::fs::write(
+                dir.join("Dockerfile"),
+                format!("FROM vendor/{service}:{tag}@sha256:{digest}\n"),
+            )
+            .unwrap();
+        };
+        pin("clickhouse", "lts", "2");
+        pin("clickhouse", "old", "1");
+        std::fs::write(root.join("ci/clickhouse/PRIMARY"), "lts\n").unwrap();
+        pin("s3", "main", "1");
+        pin("s3", "notifying", "2");
+        pin("s3", "plain", "3");
+        std::fs::write(root.join("ci/s3/PRIMARY"), "main\n").unwrap();
+        std::fs::write(root.join("ci/s3/notifying/CAPABILITIES"), "notifications\n").unwrap();
+
+        let lanes = super::extra_lanes(&root);
+        drop(std::fs::remove_dir_all(&root));
+        let lanes = lanes.unwrap();
+        assert_eq!(lanes.clickhouse, ["old"]);
+        assert_eq!(
+            lanes.s3,
+            [
+                StoreLane::new("notifying", &[Capability::Notifications]),
+                StoreLane::new("plain", &[]),
+            ]
+        );
+    }
+
     /// Each argument arm refuses what it does not define. The command line
     /// parser answers both shapes first, so neither refusal is reachable
     /// through the binary.
