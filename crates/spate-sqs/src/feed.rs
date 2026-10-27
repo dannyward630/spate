@@ -1149,11 +1149,13 @@ fn held_from(m: Received, sent_at: Instant, hold_end: Instant, visibility: Durat
 /// Sends each hand-back as it is queued. Every renewal period, extends each
 /// held unit marked since the last tick, and each buffered unit when the
 /// reader was active since the last tick; once the worker stops, every held
-/// unit.
+/// unit. A tick's batches are extended together, each bounded as
+/// [`extend_chunk`] says, and a batch whose call fails with a renewal period
+/// or less left is sent once more at once.
 ///
 /// Hand-backs and extensions go out from this one task, so a unit is never
-/// handed back while an extension of it is in flight, and is not extended
-/// after its hand-back.
+/// handed back while an extension of it is in flight from this task, and is
+/// not extended after its hand-back.
 async fn renewal_task(shared: Arc<Shared>) {
     let settings = shared.settings;
     // No tick at start: a unit received before the first one still has its
@@ -1204,81 +1206,164 @@ async fn renewal_task(shared: Arc<Shared>) {
                 .collect()
         };
         due.sort_by_key(|(receipt, _, _)| *receipt);
-        for chunk in due.chunks(BATCH_ENTRIES) {
-            // Re-read: a unit handed back or settled while an earlier chunk
-            // was in flight is extended no more, and a stop that came in
-            // the meantime bounds the calls left.
-            let (chunk, within): (Vec<&(u64, String, Duration)>, _) = {
-                let st = shared.lock();
-                (
-                    chunk
-                        .iter()
-                        .filter(|(receipt, _, _)| st.held.contains_key(receipt))
-                        .collect(),
-                    st.stopping.then_some(STOP_EXTENSION_BOUND),
-                )
-            };
-            if chunk.is_empty() {
-                continue;
-            }
-            let entries = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, (_, handle, ext))| VisibilityEntry {
-                    id: i.to_string(),
-                    handle: handle.clone(),
-                    // At most 12 h, so the cast cannot truncate.
-                    seconds: ext.as_secs() as i32,
+        // The tick's chunks go out together, so a slow call takes no time
+        // from the others. Hand-backs wait for every call in flight.
+        // A batch sent once more goes as soon as its own call fails, since
+        // its deadline does not wait for the slowest batch of the tick.
+        join_all(
+            due.chunks(BATCH_ENTRIES)
+                .map(|chunk| {
+                    let shared = &shared;
+                    async move {
+                        if extend_chunk(shared, chunk, true).await == Extended::Again {
+                            extend_chunk(shared, chunk, false).await;
+                        }
+                    }
                 })
-                .collect();
-            let sent_at = Instant::now();
-            match shared.queue.change_visibility_batch(entries, within).await {
-                Ok(outcome) => {
-                    let mut st = shared.lock();
-                    for (i, (receipt, _, ext)) in chunk.iter().enumerate() {
-                        let Some(h) = st.held.get_mut(receipt) else {
-                            continue;
-                        };
-                        match entry_result(&outcome, i) {
-                            // `ext` was cut to the hold at the tick, before
-                            // the calls for earlier chunks ran.
-                            Some(Ok(())) => h.deadline = (sent_at + *ext).min(h.hold_end),
-                            Some(Err(failure))
-                                if code_is(&failure.code, "ReceiptHandleIsInvalid")
-                                    || code_is(&failure.code, "MessageNotInflight") =>
-                            {
-                                h.gone = true;
-                            }
-                            // It lapses at its own deadline.
-                            Some(Err(failure)) => tracing::debug!(
-                                code = %failure.code,
-                                "SQS refused to extend a held unit"
-                            ),
-                            None => {}
-                        }
-                    }
-                }
-                Err(e) if e.class == Class::Fatal => {
-                    shared.set_fatal(&e);
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e.message, "extending held units failed");
-                    // Marked again, so the next tick tries them with a fresh
-                    // extension.
-                    let mut st = shared.lock();
-                    for (receipt, _, _) in &chunk {
-                        if let Some(h) = st.held.get_mut(receipt) {
-                            h.marked = true;
-                        }
-                    }
-                }
-            }
-            if send_hand_backs(&shared).await.is_err() {
-                return;
-            }
+                .collect(),
+        )
+        .await;
+        // `Err` too once a call failed Fatal.
+        if send_hand_backs(&shared).await.is_err() {
+            return;
         }
     }
+}
+
+/// What became of one batch's extension call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Extended {
+    /// Answered, failed and marked for the next tick, or failed Fatal.
+    Done,
+    /// Failed with one renewal period or less left, to send once more now.
+    Again,
+}
+
+/// Extend one batch of up to ten held units. The call is given up after one
+/// renewal period, or half the time left to the batch's earliest deadline if
+/// that is shorter, so a call given up leaves the other half for one more;
+/// once the worker stops, after [`STOP_EXTENSION_BOUND`]. `Again` only when
+/// `once_more` is set.
+async fn extend_chunk(
+    shared: &Shared,
+    chunk: &[(u64, String, Duration)],
+    once_more: bool,
+) -> Extended {
+    let settings = shared.settings;
+    // Re-read: a unit handed back or settled since the tick is extended no
+    // more, and a stop that came in the meantime bounds the call.
+    let (chunk, earliest, within) = {
+        let st = shared.lock();
+        let chunk: Vec<&(u64, String, Duration)> = chunk
+            .iter()
+            .filter(|(receipt, _, _)| st.held.contains_key(receipt))
+            .collect();
+        let earliest = chunk
+            .iter()
+            .filter_map(|(receipt, _, _)| st.held.get(receipt))
+            .map(|h| h.deadline)
+            .min();
+        let within = if st.stopping {
+            STOP_EXTENSION_BOUND
+        } else {
+            let left = earliest.map_or(Duration::ZERO, |d| d - Instant::now());
+            // At most a period, so a buffered unit keeps the period
+            // `receive` asks of it.
+            settings.period.min(left / 2)
+        };
+        (chunk, earliest, within)
+    };
+    let Some(earliest) = earliest else {
+        return Extended::Done;
+    };
+    let entries = chunk
+        .iter()
+        .enumerate()
+        .map(|(i, (_, handle, ext))| VisibilityEntry {
+            id: i.to_string(),
+            handle: handle.clone(),
+            // At most 12 h, so the cast cannot truncate.
+            seconds: ext.as_secs() as i32,
+        })
+        .collect();
+    let sent_at = Instant::now();
+    match shared
+        .queue
+        .change_visibility_batch(entries, Some(within))
+        .await
+    {
+        Ok(outcome) => {
+            let mut st = shared.lock();
+            for (i, (receipt, _, ext)) in chunk.iter().enumerate() {
+                let Some(h) = st.held.get_mut(receipt) else {
+                    continue;
+                };
+                match entry_result(&outcome, i) {
+                    // `ext` was cut to the hold at the tick.
+                    Some(Ok(())) => h.deadline = (sent_at + *ext).min(h.hold_end),
+                    Some(Err(failure))
+                        if code_is(&failure.code, "ReceiptHandleIsInvalid")
+                            || code_is(&failure.code, "MessageNotInflight") =>
+                    {
+                        h.gone = true;
+                    }
+                    // It lapses at its own deadline.
+                    Some(Err(failure)) => tracing::debug!(
+                        code = %failure.code,
+                        "SQS refused to extend a held unit"
+                    ),
+                    None => {}
+                }
+            }
+            Extended::Done
+        }
+        Err(e) if e.class == Class::Fatal => {
+            shared.set_fatal(&e);
+            Extended::Done
+        }
+        Err(e) => {
+            tracing::warn!(error = %e.message, "extending held units failed");
+            // With a period or less left, the next tick comes too late.
+            // Otherwise the units are marked again, so the next tick tries
+            // them with a fresh extension.
+            if once_more && earliest.saturating_duration_since(Instant::now()) <= settings.period {
+                return Extended::Again;
+            }
+            let mut st = shared.lock();
+            for (receipt, _, _) in &chunk {
+                if let Some(h) = st.held.get_mut(receipt) {
+                    h.marked = true;
+                }
+            }
+            Extended::Done
+        }
+    }
+}
+
+/// Poll `futures` together on the calling task, and return their outputs in
+/// order once every one is ready.
+async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut futures: Vec<_> = futures.into_iter().map(Box::pin).collect();
+    let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut ready = true;
+        for (future, output) in futures.iter_mut().zip(&mut outputs) {
+            // A future is never polled again once it has answered.
+            if output.is_none() {
+                match future.as_mut().poll(cx) {
+                    Poll::Ready(v) => *output = Some(v),
+                    Poll::Pending => ready = false,
+                }
+            }
+        }
+        if ready {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    outputs.into_iter().flatten().collect()
 }
 
 /// Send the queued hand-backs, each setting its unit visible at once, in
