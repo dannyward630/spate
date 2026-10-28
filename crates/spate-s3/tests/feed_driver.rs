@@ -1150,6 +1150,66 @@ fn overwrite_yaml() -> String {
         .build()
 }
 
+/// Pins that a thread keeps reading a lane while a finished sibling lane on
+/// it waits on the sink for its acknowledgement.
+#[test]
+fn a_finished_lane_waiting_on_the_sink_does_not_starve_its_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = data_dir(&dir);
+    let (rows_a, rows_b) = (recs("a", 20), recs("b", 20));
+    stage(&data, "a.ndjson", &rows_a);
+    stage(&data, "b.ndjson", &rows_b);
+    let (feed, script) = scripted_feed();
+    for name in ["a.ndjson", "b.ndjson"] {
+        let (etag, size) = (etag_of(&data, name), size_of(&data, name));
+        script.deliver(pinned_notification(name, size, &etag, 0));
+    }
+    let store = ScriptedStore::new(dir.path());
+    store.hold_get(2);
+    let yaml = PipelineYaml::endpoint("s3-finished-sibling-held", "http://127.0.0.1:9")
+        .fed_by_code()
+        .threads(1)
+        .build();
+    let feed: Arc<dyn Feed> = Arc::new(feed);
+    let held_store = Arc::clone(&store);
+    let l = launch_customized(
+        &yaml,
+        test_options(),
+        |sink| sink.enqueue_global(WriteOutcome::ok().held()),
+        move |source, _io| line_framer(source).with_store(held_store).with_feed(feed),
+    );
+    // The first object's write is held, so its lane stays on the thread,
+    // finished and unacknowledged, while the second object's bytes arrive.
+    wait_until(DEADLINE, "the second GET is held", || store.holding());
+    wait_until(DEADLINE, "the first object's write is held", || {
+        l.script.held_writes() == 1
+    });
+    store.release();
+    // Whichever object the held GET belongs to, its rows can only reach the
+    // sink in a second write, read while the first object's lane is still
+    // on the thread, finished and held.
+    wait_until(
+        DEADLINE,
+        "the second object is read beside the finished lane",
+        || l.script.writes().len() >= 2,
+    );
+    // Only the first object's write is held, so at most the second unit can
+    // have been acknowledged.
+    assert!(
+        script.acknowledged().len() < 2,
+        "the first unit is still held"
+    );
+    l.script.release_held();
+    wait_until(DEADLINE, "both units are acknowledged", || {
+        script.acknowledged().len() == 2
+    });
+    stop(&l);
+    let every: Vec<String> = rows_a.iter().chain(&rows_b).cloned().collect();
+    let mut got = sorted(captured_rows(&l.script));
+    got.dedup();
+    assert_eq!(got, sorted(every));
+}
+
 /// A notification in bucket `b` creating `data/<name>` at `size` bytes,
 /// pinned to `etag` sent without its quotes, as S3 sends it, after
 /// `re_enqueues` re-enqueues.
