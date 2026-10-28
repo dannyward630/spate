@@ -16,11 +16,22 @@ use crate::record::{PartitionId, RawPayload};
 use crate::source::{
     DrainBarrier, LaneId, PayloadBatch, Source, SourceCtx, SourceEvent, SourceLane,
 };
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
+
+/// Once `polled` has been polled, the first finished `finished()` read of
+/// `lane` that directly follows a finished read of `after` signals `reached`
+/// and blocks until `go` fires.
+pub(crate) struct FinishedHook {
+    pub(crate) polled: LaneId,
+    pub(crate) after: LaneId,
+    pub(crate) lane: LaneId,
+    pub(crate) reached: mpsc::Sender<()>,
+    pub(crate) go: mpsc::Receiver<()>,
+}
 
 #[derive(Default)]
 pub(crate) struct SourceLog {
@@ -35,6 +46,18 @@ pub(crate) struct SourceLog {
     pub(crate) stage_metrics_attached: bool,
     /// The thread count `open` received.
     pub(crate) threads: Option<NonZeroUsize>,
+    /// Lanes that report `finished` from the empty poll after their last
+    /// batch, returning it without waiting, as a lane that has decided its
+    /// end of input does.
+    pub(crate) finishing: BTreeSet<LaneId>,
+    /// Every lane poll, with the timeout the driver passed.
+    pub(crate) lane_polls: Vec<(LaneId, Duration)>,
+    /// How many times the driver asked each lane whether it has finished.
+    pub(crate) finished_calls: BTreeMap<LaneId, usize>,
+    /// When set, blocks one `finished()` read; see [`FinishedHook`].
+    pub(crate) finished_hook: Option<FinishedHook>,
+    /// The previous `finished()` read: the lane and its answer.
+    pub(crate) last_finished_read: Option<(LaneId, bool)>,
     /// When set, `commit` and `flush_commits` fail retryably, modeling a
     /// checkpoint store outage; nothing is recorded as committed.
     pub(crate) fail_commits: bool,
@@ -202,6 +225,7 @@ impl Source for FakeSource {
                         current: Vec::new(),
                         issuer: issuer.clone(),
                         log: Arc::clone(&self.shared),
+                        finished: false,
                     })
                     .collect();
                 Ok(SourceEvent::LanesAssigned(lanes))
@@ -217,6 +241,7 @@ impl Source for FakeSource {
                         current: Vec::new(),
                         issuer: issuer.clone(),
                         log: Arc::clone(&self.shared),
+                        finished: false,
                     })
                     .collect();
                 Ok(SourceEvent::LanesAdded(lanes))
@@ -358,6 +383,7 @@ pub(crate) struct FakeLane {
     current: Vec<(i64, Vec<u8>)>,
     issuer: AckIssuer,
     log: SharedLog,
+    finished: bool,
 }
 
 impl Drop for FakeLane {
@@ -387,6 +413,11 @@ impl SourceLane for FakeLane {
         _max_records: usize,
         timeout: Duration,
     ) -> Result<Option<FakeBatch<'_>>, SourceError> {
+        let finishing = {
+            let mut log = self.log.lock().unwrap();
+            log.lane_polls.push((self.id, timeout));
+            log.finishing.contains(&self.id)
+        };
         match self.batches.pop_front() {
             Some(batch) => {
                 self.current = batch;
@@ -399,11 +430,39 @@ impl SourceLane for FakeLane {
                     ack,
                 }))
             }
+            None if finishing => {
+                self.finished = true;
+                Ok(None)
+            }
             None => {
                 std::thread::sleep(timeout.min(Duration::from_millis(2)));
                 Ok(None)
             }
         }
+    }
+
+    fn finished(&self) -> bool {
+        let hook = {
+            let mut log = self.log.lock().unwrap();
+            *log.finished_calls.entry(self.id).or_default() += 1;
+            let previous = log.last_finished_read.replace((self.id, self.finished));
+            if self.finished
+                && log.finished_hook.as_ref().is_some_and(|h| {
+                    h.lane == self.id
+                        && previous == Some((h.after, true))
+                        && log.lane_polls.iter().any(|(l, _)| *l == h.polled)
+                })
+            {
+                log.finished_hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some(hook) = hook {
+            hook.reached.send(()).unwrap();
+            hook.go.recv().unwrap();
+        }
+        self.finished
     }
 }
 
