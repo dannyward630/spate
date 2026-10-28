@@ -1387,7 +1387,10 @@ mod tests {
             let Decoded::Read(cursors) = decoded(&[record]) else {
                 panic!("not read");
             };
-            assert_eq!(cursors[0].object[0].last_modified_ms, RecordMeta::NO_EVENT_TIME);
+            assert_eq!(
+                cursors[0].object[0].last_modified_ms,
+                RecordMeta::NO_EVENT_TIME
+            );
         }
     }
 

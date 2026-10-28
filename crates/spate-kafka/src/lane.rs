@@ -209,7 +209,10 @@ mod tests {
     /// A missing Kafka timestamp is distinct from Unix epoch. Regression for #1285.
     #[test]
     fn unavailable_timestamp_uses_no_event_time_sentinel() {
-        assert_eq!(source_event_time_ms(Timestamp::NotAvailable), RecordMeta::NO_EVENT_TIME);
+        assert_eq!(
+            source_event_time_ms(Timestamp::NotAvailable),
+            RecordMeta::NO_EVENT_TIME
+        );
         assert_eq!(source_event_time_ms(Timestamp::CreateTime(0)), 0);
     }
 }
