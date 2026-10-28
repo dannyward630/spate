@@ -1,6 +1,7 @@
 //! Unit descriptors and deterministic unit identity.
 //!
-//! A unit of work is one object or one byte range of one object. The
+//! A unit of work is one object, one byte range of one object, or several
+//! objects read whole in turn. The
 //! [`SplitDescriptor`] carries the unit's member objects (keys, sizes, ETags)
 //! and its range, if it has one, verbatim to whichever worker receives the
 //! unit, so workers never list.
@@ -38,6 +39,11 @@ use sha2::{Digest as _, Sha256};
 /// to the descriptor's schema; a worker refuses a descriptor written by an
 /// incompatible release instead of misreading it.
 pub const DESCRIPTOR_VERSION: u32 = 2;
+
+/// The most member objects a descriptor may name for the source to read it.
+/// A unit naming more is failed back. Far below the composite offset's
+/// ordinal space, so no unit's ordinal overflows it.
+pub const MAX_UNIT_MEMBERS: usize = 4096;
 
 /// Version folded into every id by [`split_id_for`] and
 /// [`split_id_for_range`]. It is part of the persisted identity, so a change
@@ -133,6 +139,14 @@ impl SplitRange {
 /// [`encode`](SplitDescriptor::encode) refuses anything else) and mint ids
 /// with [`split_id_for`] or [`split_id_for_range`] respectively, which
 /// together are the whole cross-process contract. Fields are freely readable.
+///
+/// The source reads a descriptor of one member whole, in byte ranges when the
+/// member qualifies for cutting, or as the byte range the descriptor names. It
+/// reads a descriptor of two or more members whole, member by member in order,
+/// on one lane, and a member named twice is read once per mention. It fails
+/// back a descriptor that names no member or more than [`MAX_UNIT_MEMBERS`],
+/// carries an ETag `If-Match` cannot send, or names a byte range cut on a
+/// delimiter other than the framer's or of an object the source decompresses.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SplitDescriptor {
     /// Encoding version; always [`DESCRIPTOR_VERSION`] at write. Private to
