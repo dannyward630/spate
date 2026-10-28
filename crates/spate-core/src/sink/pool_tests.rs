@@ -929,12 +929,11 @@ async fn chunks_left_in_a_gated_queue_are_sealed_at_drain() {
     assert_eq!(f.budget.usage(), 0);
 }
 
-/// A sink outage is a routine way to reach this deadlock without a hung write.
-/// The default `retry.max_attempts` is 0 (unbounded), so every write task
-/// retries forever and never releases its permit. Shutdown during an outage
-/// therefore reaches the same wedge on the default configuration.
+/// With the default `retry.max_attempts` of 0, a failed write retries without
+/// a limit and holds its permit. A later dispatch would block behind that
+/// permit; this test checks that shutdown returns at its deadline.
 #[tokio::test(start_paused = true)]
-async fn a_down_sink_retrying_forever_does_not_wedge_dispatch_at_shutdown() {
+async fn a_held_permit_does_not_wedge_dispatch_at_shutdown() {
     let mut cfg = SinkPoolConfig {
         batch: BatchConfig {
             max_rows: u64::MAX,
